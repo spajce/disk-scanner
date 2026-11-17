@@ -1,0 +1,17 @@
+[package]
+name = "disk-scan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Disk usage walker and volume discovery shared by the desktop apps"
+
+[dependencies]
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_WindowsProgramming",
+] }

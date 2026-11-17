@@ -1,0 +1,17 @@
+[package]
+name = "desktop-gpui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+
+[[bin]]
+name = "disk-scanner"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2"
+disk-scan = { path = "../../crates/disk-scan" }
+rayon = "1.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell"] }

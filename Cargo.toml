@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["apps/desktop-gpui", "crates/disk-scan"]
+exclude = ["src-tauri"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+
+# The walker is unusable at opt-level 0 (megabytes per second); keep the
+# scanner fast while iterating on the UI.
+[profile.dev.package.disk-scan]
+opt-level = 2
+
+[profile.dev.package.rayon-core]
+opt-level = 2

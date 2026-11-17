@@ -2,8 +2,7 @@
 
 A desktop disk-usage explorer that renders a whole volume as a zoomable **sunburst** —
 every folder level at once, sized by bytes or by file count, in the spirit of the classic
-Scanner (Steffen Gerlach, 2012) but rebuilt with a Rust scanner and a hand-rolled SVG
-chart.
+Scanner (Steffen Gerlach, 2012) but rebuilt as a native Rust app.
 
 ![Disk Scanner](docs/screenshot.png)
 
@@ -11,84 +10,98 @@ chart.
 
 - **Scans a volume or folder in parallel** with a `rayon`-backed walker; one pass, no
   index file, cancellable at any time.
-- **Renders a multilevel sunburst**: the hub shows the current folder, each ring is one
-  directory level deeper. Click a slice to zoom in; the hub, rings, breadcrumbs and the
-  breakdown panel follow.
+- **Renders a multilevel sunburst** on the GPU through GPUI (Zed's UI framework): the hub
+  shows the current folder, each ring is one directory level deeper. Click a slice to zoom
+  in; hover to trace a slice's ancestry; the hub, labels and the breakdown panel follow.
 - **Weights rings by size or by file count** — the same tree, re-proportioned.
 - **Breakdown panel** lists the biggest direct children of the focused folder, with a
   visual share meter, and syncs hover highlighting with the chart.
+- **Right-click actions** on a slice or a breakdown row: *Reveal in Explorer*, and
+  *Delete folder* / *Delete file* (moves it to the Recycle Bin after a confirmation).
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
-- **Reveal in Explorer**, breadcrumb navigation, and keyboard zoom-out (`Backspace` / `↑`).
+- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `Esc` closes the menu, dialog or tooltip.
+
+No webview: the window, the chart and the panels are drawn by GPUI directly.
 
 ## Stack
 
 | Layer | Choice |
 | --- | --- |
-| Shell | [Tauri 2](https://tauri.app) (WebView2 on Windows) |
-| Backend | Rust — `windows-sys` for volume info, `rayon` for the parallel walk, `serde` for the DTO boundary |
-| Frontend | TypeScript + Vite, no framework, hand-written SVG chart (no d3) |
+| UI | [GPUI](https://crates.io/crates/gpui) 0.2 — native Rust rendering, no HTML/CSS |
+| Scanner | Rust — `windows-sys` for volume info and the shell, `rayon` for the parallel walk |
+| Chart | hand-rolled arc geometry (`PathBuilder` → `Window::paint_path`), no plotting crate |
 
 ## Layout
 
 ```
-src-tauri/
-  src/scanner.rs   parallel directory walk, hit counters, tree compaction
-  src/drives.rs    Win32 volume enumeration (GetLogicalDrives, GetDiskFreeSpaceExW, …)
-  src/lib.rs       Tauri commands: startup, list_drives, scan, cancel_scan, reveal
-  tauri.conf.json  window, bundling, dev/build hooks
-src/
-  chart.ts         sunburst layout + keyed angle animation + hit testing
-  main.ts          app state, zoom stack, breadcrumbs, panels, progress overlay
-  demo.ts          deterministic fixture used by the browser preview
-  format.ts        byte / count / percent / duration formatting
+apps/desktop-gpui/
+  src/main.rs    entry point: opens the 1320x880 window
+  src/app.rs     the view: top bar, chart area, breakdown panel, status bar, overlays,
+                 scan job plumbing, zoom state, context menu + delete flow
+  src/model.rs   tree model, chart layout (rings/slices), hit testing, geometry
+  src/theme.rs   colours, palette, number formatting
+  src/sys.rs     Explorer reveal + Recycle Bin (SHFileOperationW)
+crates/disk-scan/
+  src/scanner.rs parallel directory walk, hit counters, tree compaction
+  src/drives.rs  Win32 volume enumeration (GetLogicalDrives, GetDiskFreeSpaceExW, …)
 scripts/
-  rust-env.ps1     runs cargo or the Tauri CLI inside a VS developer environment
-  make_icon.py     regenerates the sunburst app icon set
+  rust-env.ps1   runs cargo inside a working Visual Studio developer environment
+  make_icon.py   regenerates the sunburst app icon set
 ```
 
 ### How the tree is made
 
-The scanner accumulates sizes bottom-up in one parallel pass. Before it crosses to the
-UI, the tree is compacted so a 2-million-file volume still renders smoothly:
+The scanner accumulates sizes bottom-up in one parallel pass. Before it reaches the UI,
+the tree is compacted so a 2-million-file volume still renders smoothly:
 
 - children sorted by size; the long tail is folded into one `(N more)` slice
   (`REL_FLOOR`, `ABS_FLOOR` thresholds);
 - loose files below `FILE_FLOOR` (and the small tail of a directory) become one
   `smaller files` slice, so a folder's arcs always add up to the number in the hub;
 - single-child chains are collapsed into `a/b/c` slices;
-- the total node count is capped (`NODE_BUDGET`), and depth is bounded.
+- the total node count is capped (`NODE_BUDGET`) and depth is bounded.
 
-The frontend never walks a raw directory tree — it only lays out what the backend
-decided is worth showing.
+The UI never walks a raw directory tree — it only lays out what the scanner decided is
+worth showing, and caps itself at `MAX_RINGS` rings and `MAX_SLICES` arcs per view.
 
-## Development
+## Building
+
+Requires Rust 1.85+, the MSVC toolchain and the Windows SDK.
 
 ```bash
-pnpm install
-pnpm dev            # browser preview with demo data (no Rust needed)
-pnpm tauri dev      # real app against a real volume
-pnpm build          # typecheck + production frontend bundle
-pnpm test:rust      # scanner unit tests (cargo test via the VS environment)
-pnpm test           # typecheck + rust tests
-pnpm tauri build    # release app + NSIS installer in src-tauri/target/release/bundle
+cargo build --release          # target/release/disk-scanner.exe
+cargo run                      # debug build, scans the last folder you opened
+cargo test                     # scanner tests + Recycle Bin integration test
 ```
+
+On a machine with several Visual Studio installs, run cargo inside a correctly configured
+environment instead:
+
+```powershell
+scripts\rust-env.ps1 cargo build --release
+```
+
+The app remembers the last scanned root in `%APPDATA%\disk-scanner\last-root.txt` and
+rescans it on start (falling back to the first fixed drive).
 
 ### Running on a machine with several Visual Studio installs
 
-`rustc` and the `cc` crate both pick the *newest* Visual Studio install. If that install
-is incomplete (a pre-release toolset without headers or `lib\x64`), a plain `cargo build`
-fails with `LNK1104: cannot open file 'msvcrt.lib'`. `scripts/rust-env.ps1` finds the
-first install whose MSVC toolset actually contains `include\excpt.h` + `lib\x64\msvcrt.lib`,
-imports the environment from its `vcvars64.bat`, and then invokes cargo. Both `pnpm tauri`
-and `pnpm cargo` go through it, so on a healthy machine it behaves exactly like a plain
-`cargo` call.
+`rustc` and the `cc` crate both pick the *newest* Visual Studio install. If that install is
+incomplete (a pre-release toolset without headers or `lib\x64`), a plain `cargo build`
+fails with `LNK1104: cannot open file 'msvcrt.lib'`. `scripts/rust-env.ps1` finds the first
+install whose MSVC toolset actually contains `include\excpt.h` + `lib\x64\msvcrt.lib`,
+imports the environment from its `vcvars64.bat`, and then invokes cargo.
 
 ## Notes
 
 - Symlinks and every other reparse point (junctions, mount points, dedup stubs) are
-  skipped, so `Users\All Users -> ProgramData` cannot double-count a volume and
-  junction loops cannot trap the walk.
+  skipped, so `Users\All Users -> ProgramData` cannot double-count a volume and junction
+  loops cannot trap the walk.
 - Paths longer than `MAX_PATH` are handled through the `\\?\` verbatim form internally.
 - Files that vanish mid-scan (locked, deleted, permission denied) are counted as skipped
   errors instead of aborting the scan.
+- Deletes go through `SHFileOperationW` with `FOF_ALLOWUNDO`, so they land in the Recycle
+  Bin; drive roots are refused.
+- The first prototype of this app was a Tauri + TypeScript build; it lives in git history
+  at commit `bbb8283`. The native GPUI app replaced it.

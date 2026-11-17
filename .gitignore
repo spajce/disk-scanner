@@ -1,15 +1,15 @@
-# Dependencies
-node_modules/
-.pnpm-store/
-
-# Frontend build output
-dist/
-
 # Rust build output
+/target/
 src-tauri/target/
 
-# Local screenshots / scratch
+# Dependencies (legacy web build, kept in git history only)
+node_modules/
+.pnpm-store/
+dist/
+
+# Local screenshots / scratch / fixtures
 .shots/
+.testdata/
 *.log
 
 # Editor / OS noise
