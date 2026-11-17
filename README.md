@@ -16,6 +16,9 @@ Scanner (Steffen Gerlach, 2012) but rebuilt as a native Rust app.
 - **Weights rings by size or by file count** — the same tree, re-proportioned.
 - **Breakdown panel** lists the biggest direct children of the focused folder, with a
   visual share meter, and syncs hover highlighting with the chart.
+- **Clickable path** in the focus card: every folder name in `C:\Users\…\Xamarin` is a
+  breadcrumb segment, so one click re-centres the chart on that folder (and on a folder
+  outside the current scan it simply starts scanning it).
 - **Right-click actions** on a slice or a breakdown row: *Reveal in Explorer*, and
   *Delete folder* / *Delete file* (moves it to the Recycle Bin after a confirmation).
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space

@@ -178,6 +178,34 @@ impl DiskApp {
         cx.notify();
     }
 
+    /// Jumps the chart to any folder whose absolute path we can resolve, which
+    /// is what a click on a breadcrumb segment does. Paths that sit above the
+    /// scanned root are not in the tree, so those become a fresh scan of that
+    /// folder instead of a dead click.
+    fn jump_to(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(tree) = self.tree.clone() else { return };
+        let mut candidates = vec![path.clone()];
+        let trimmed = path.trim_end_matches('\\');
+        if trimmed != path {
+            candidates.push(trimmed.to_string());
+        } else {
+            candidates.push(format!("{trimmed}\\"));
+        }
+        if let Some(node) = candidates
+            .iter()
+            .find_map(|candidate| Node::find(&tree, candidate))
+        {
+            self.set_focus(node, cx);
+            return;
+        }
+        if std::path::Path::new(&path).is_dir() {
+            self.switch_to(path, cx);
+        } else {
+            self.note = Some(format!("{} is not in this scan", short_name(&path, 44)));
+            cx.notify();
+        }
+    }
+
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let Some(tree) = self.tree.clone() else { return };
         let current = self.focus_path.clone();
@@ -1062,6 +1090,55 @@ impl DiskApp {
         }
     }
 
+    /// The focused folder's path, one clickable segment per level. Clicking a
+    /// segment re-centres the chart on that folder.
+    fn path_crumbs(&self, path: &str, cx: &mut Context<Self>) -> Div {
+        let mut segments = breadcrumb_segments(path);
+        // Deep paths would wrap the card: keep the tail and fold the rest.
+        let mut folded = false;
+        if segments.len() > 6 {
+            segments = segments.split_off(segments.len() - 5);
+            folded = true;
+        }
+        let last = segments.len().saturating_sub(1);
+
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(1.0))
+            .text_size(px(10.0))
+            .text_color(theme::text_faint());
+        if folded {
+            row = row.child(div().px(px(2.0)).child("…"));
+        }
+        for (index, (label, full)) in segments.into_iter().enumerate() {
+            if index > 0 || folded {
+                row = row.child(div().px(px(1.0)).opacity(0.45).child("\\"));
+            }
+            let color = if index == last {
+                theme::text_dim()
+            } else {
+                theme::text_faint()
+            };
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("crumb-{index}")))
+                    .px(px(3.0))
+                    .py(px(1.0))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .text_color(color)
+                    .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to(full.clone(), cx);
+                    }))
+                    .child(label),
+            );
+        }
+        row
+    }
+
     fn panel(&self, cx: &mut Context<Self>) -> Div {
         let Some(chart) = self.chart.clone() else {
             return div().w(px(PANEL_W)).flex_shrink_0();
@@ -1217,13 +1294,7 @@ impl DiskApp {
                             )
                             .child(self.action_button("Up", cx, |this, cx| this.go_up(cx))),
                     )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(10.0))
-                            .text_color(theme::text_faint())
-                            .child(focus.path.clone()),
-                    )
+                    .child(self.path_crumbs(&focus.path, cx))
                     .child(
                         div()
                             .mt(px(6.0))
@@ -1544,6 +1615,41 @@ impl DiskApp {
     }
 }
 
+/// Splits an absolute path into `(label, full path)` pairs, one per level, so
+/// the panel can render it as a breadcrumb.
+fn breadcrumb_segments(path: &str) -> Vec<(String, String)> {
+    let trimmed = path.trim_end_matches('\\');
+    // UNC shares and verbatim paths keep a single, unsplittable label.
+    if trimmed.is_empty() || trimmed.starts_with("\\\\") || !trimmed.contains('\\') {
+        let full = if trimmed.contains('\\') || trimmed.is_empty() {
+            path.to_string()
+        } else {
+            format!("{trimmed}\\")
+        };
+        return vec![(trimmed.to_string(), full)];
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut prefix = String::new();
+    for (index, part) in trimmed.split('\\').enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if index == 0 {
+            prefix = format!("{part}\\");
+        } else if prefix.ends_with('\\') {
+            prefix.push_str(part);
+        } else {
+            prefix.push('\\');
+            prefix.push_str(part);
+        }
+        out.push((part.to_string(), prefix.clone()));
+    }
+    if out.is_empty() {
+        return vec![(trimmed.to_string(), path.to_string())];
+    }
+    out
+}
+
 fn stat(label: &str, value: String) -> Div {
     div()
         .flex()
@@ -1838,5 +1944,44 @@ pub fn open(cx: &mut App) {
 
 #[allow(dead_code)]
 const _: usize = MAX_RINGS;
+
+#[cfg(test)]
+mod tests {
+    use super::breadcrumb_segments;
+
+    #[test]
+    fn splits_a_folder_path_into_clickable_levels() {
+        let crumbs = breadcrumb_segments(r"C:\Users\jcarillo\AppData\Local\Xamarin");
+        let labels: Vec<_> = crumbs.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["C:", "Users", "jcarillo", "AppData", "Local", "Xamarin"]
+        );
+        let paths: Vec<_> = crumbs.iter().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                r"C:\",
+                r"C:\Users",
+                r"C:\Users\jcarillo",
+                r"C:\Users\jcarillo\AppData",
+                r"C:\Users\jcarillo\AppData\Local",
+                r"C:\Users\jcarillo\AppData\Local\Xamarin",
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_a_drive_root_as_one_segment() {
+        assert_eq!(breadcrumb_segments(r"C:\"), vec![("C:".into(), r"C:\".into())]);
+        assert_eq!(breadcrumb_segments(r"C:"), vec![("C:".into(), r"C:\".into())]);
+    }
+
+    #[test]
+    fn leaves_unc_paths_alone() {
+        let unc = r"\\server\share\folder";
+        assert_eq!(breadcrumb_segments(unc), vec![(unc.into(), unc.into())]);
+    }
+}
 #[allow(dead_code)]
 const _: f32 = TAU;
