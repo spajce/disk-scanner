@@ -312,6 +312,28 @@ impl DiskApp {
     }
 
     fn start_scan(&mut self, root: String, cx: &mut Context<Self>) {
+        self.scan_into(root, false, cx)
+    }
+
+    /// Rescan what the user is looking at: the folder in the focus card when
+    /// they have zoomed in, otherwise the whole volume. Refreshing a subfolder
+    /// only re-walks that subtree and splices it back into the tree, so it
+    /// stays fast on a system drive.
+    fn rescan_focus(&mut self, cx: &mut Context<Self>) {
+        let root = self.last_root.clone();
+        let focus = self.focus_path.clone();
+        let inside = !focus.is_empty()
+            && !focus.eq_ignore_ascii_case(&root)
+            && self.tree.is_some()
+            && std::path::Path::new(&focus).is_dir();
+        if inside {
+            self.scan_into(focus, true, cx);
+        } else {
+            self.scan_into(root, false, cx);
+        }
+    }
+
+    fn scan_into(&mut self, target: String, subtree: bool, cx: &mut Context<Self>) {
         if let Some(job) = &self.job {
             job.cancel.store(true, Ordering::Relaxed);
         }
@@ -324,19 +346,27 @@ impl DiskApp {
             generation,
         });
         self.phase = Phase::Scanning;
-        self.progress = (0, 0, root.clone());
+        self.progress = (0, 0, target.clone());
         self.hover = None;
         self.tooltip = None;
         self.menu = None;
         self.confirm = None;
         self.note = None;
-        let same_root = self.last_root.eq_ignore_ascii_case(&root);
-        self.last_root = root.clone();
-        save_last_root(&root);
+
+        if subtree {
+            // Keep the chart and the volume totals; only the pill changes.
+            cx.notify();
+            self.spawn_scan(target, subtree, generation, cancel, counters, cx);
+            return;
+        }
+
+        let same_root = self.last_root.eq_ignore_ascii_case(&target);
+        self.last_root = target.clone();
+        save_last_root(&target);
 
         // A drive we have already walked is painted from memory straight away;
         // the scan then runs behind it and refreshes the numbers in place.
-        if let Some(cached) = self.cache.get(&cache_key(&root)) {
+        if let Some(cached) = self.cache.get(&cache_key(&target)) {
             let tree = cached.tree.clone();
             let focus = if same_root && !self.focus_path.is_empty() {
                 Node::find(&tree, &self.focus_path).unwrap_or_else(|| tree.clone())
@@ -348,7 +378,18 @@ impl DiskApp {
             self.tree = Some(tree);
         }
         cx.notify();
+        self.spawn_scan(target, subtree, generation, cancel, counters, cx);
+    }
 
+    fn spawn_scan(
+        &mut self,
+        target: String,
+        subtree: bool,
+        generation: u64,
+        cancel: Arc<AtomicBool>,
+        counters: Arc<ScanCounters>,
+        cx: &mut Context<Self>,
+    ) {
         // Progress: a cheap snapshot every 120 ms, so the UI stays live while
         // the walker chews through millions of files.
         let tick_counters = counters.clone();
@@ -375,10 +416,11 @@ impl DiskApp {
 
         // The walk itself runs on a background thread; the DTO conversion and
         // the Arc tree are built there too.
+        let walk_root = target.clone();
         cx.spawn(async move |this, cx| {
             let work = cx.background_spawn(async move {
                 let started = Instant::now();
-                match scan(Path::new(&root), &cancel, &counters) {
+                match scan(Path::new(&walk_root), &cancel, &counters) {
                     Ok(raw) => {
                         let total = raw.size;
                         let dto = to_dto(&raw, total);
@@ -390,7 +432,7 @@ impl DiskApp {
                 }
             });
             let result = work.await;
-            this.update(cx, |this, cx| this.finish_scan(generation, result, cx))
+            this.update(cx, |this, cx| this.finish_scan(generation, target, subtree, result, cx))
                 .ok();
         })
         .detach();
@@ -399,6 +441,8 @@ impl DiskApp {
     fn finish_scan(
         &mut self,
         generation: u64,
+        target: String,
+        subtree: bool,
         result: Result<(Arc<Node>, f64, bool), String>,
         cx: &mut Context<Self>,
     ) {
@@ -425,6 +469,43 @@ impl DiskApp {
                     cx.notify();
                     return;
                 }
+
+                // A folder refresh only replaces that one subtree and pushes the
+                // size difference up through its ancestors.
+                if subtree {
+                    let merged = self.tree.clone().and_then(|current| {
+                        let old = Node::find(&current, &target)?;
+                        splice(&current, &target, &tree, Delta::between(&old, &tree))
+                    });
+                    if let Some(merged) = merged {
+                        let focus = Node::find(&merged, &self.focus_path)
+                            .unwrap_or_else(|| merged.clone());
+                        self.focus_path = focus.path.clone();
+                        self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+                        self.phase = Phase::Ready {
+                            elapsed,
+                            files: merged.files,
+                            bytes: merged.size,
+                        };
+                        self.cache.insert(
+                            cache_key(&self.last_root),
+                            Cached {
+                                tree: merged.clone(),
+                                elapsed,
+                                at: Instant::now(),
+                            },
+                        );
+                        self.tree = Some(merged);
+                        self.note = Some(format!(
+                            "Refreshed {} in {}",
+                            short_name(&target, 38),
+                            theme::format_seconds(elapsed)
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                }
+
                 self.focus_path = tree.path.clone();
                 self.chart = Some(Arc::new(build_chart(tree.clone(), self.metric)));
                 self.phase = Phase::Ready {
@@ -564,10 +645,22 @@ impl DiskApp {
                     .child(self.metric_button("Files", Metric::Files, cx)),
             )
             .child(self.theme_button(cx))
-            .child(self.action_button("Rescan", cx, |this, cx| {
-                let root = this.last_root.clone();
-                this.start_scan(root, cx);
+            .child(self.action_button(self.rescan_label(), cx, |this, cx| {
+                this.rescan_focus(cx);
             }))
+    }
+
+    /// The Rescan button says what it will actually do: refresh the folder in
+    /// the focus card once you have zoomed in, otherwise re-walk the volume.
+    fn rescan_label(&self) -> &'static str {
+        let inside = !self.focus_path.is_empty()
+            && !self.focus_path.eq_ignore_ascii_case(&self.last_root)
+            && self.tree.is_some();
+        if inside {
+            "Rescan folder"
+        } else {
+            "Rescan"
+        }
     }
 
     fn theme_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -1086,6 +1179,9 @@ impl DiskApp {
                 cx.notify();
             }
             "backspace" | "arrowup" | "arrowleft" => self.go_up(cx),
+            // Refresh the folder in the focus card, or the volume at the root.
+            "f5" => self.rescan_focus(cx),
+            "r" if event.keystroke.modifiers.control => self.rescan_focus(cx),
             _ => {}
         }
     }
@@ -1786,6 +1882,81 @@ fn arc_path(
     builder.build().map_err(|_| ())
 }
 
+#[derive(Clone, Copy, Default)]
+struct Delta {
+    size: i64,
+    files: i64,
+    dirs: i64,
+}
+
+impl Delta {
+    fn between(old: &Node, new: &Node) -> Self {
+        Self {
+            size: new.size as i64 - old.size as i64,
+            files: new.files as i64 - old.files as i64,
+            dirs: new.dirs as i64 - old.dirs as i64,
+        }
+    }
+}
+
+/// True when `child` sits somewhere below `parent` (`C:\` contains `C:\Users`).
+fn is_inside(parent: &str, child: &str) -> bool {
+    if parent.len() >= child.len() {
+        return false;
+    }
+    let (parent_bytes, child_bytes) = (parent.as_bytes(), child.as_bytes());
+    if !child_bytes[..parent_bytes.len()].eq_ignore_ascii_case(parent_bytes) {
+        return false;
+    }
+    parent.ends_with('\\') || child_bytes[parent_bytes.len()] == b'\\'
+}
+
+/// Swap the subtree at `target` for a freshly walked one, moving the size / file
+/// / folder difference up through every ancestor.
+fn splice(
+    node: &Arc<Node>,
+    target: &str,
+    replacement: &Arc<Node>,
+    delta: Delta,
+) -> Option<Arc<Node>> {
+    if node.path.eq_ignore_ascii_case(target) {
+        return Some(replacement.clone());
+    }
+
+    let mut children: Vec<Arc<Node>> = Vec::with_capacity(node.children.len());
+    let mut hit = false;
+    for child in &node.children {
+        if child.path.eq_ignore_ascii_case(target) {
+            children.push(replacement.clone());
+            hit = true;
+            continue;
+        }
+        if is_inside(&child.path, target) {
+            if let Some(updated) = splice(child, target, replacement, delta) {
+                children.push(updated);
+                hit = true;
+                continue;
+            }
+        }
+        children.push(child.clone());
+    }
+    if !hit {
+        return None;
+    }
+
+    let files = (node.files as i64 + delta.files).max(0) as u64;
+    let dirs = (node.dirs as i64 + delta.dirs).max(0) as u64;
+    Some(Arc::new(Node {
+        name: node.name.clone(),
+        path: node.path.clone(),
+        size: (node.size as i64 + delta.size).max(0) as u64,
+        files,
+        dirs,
+        kind: node.kind,
+        children,
+    }))
+}
+
 fn prune(node: &Arc<Node>, target: &str) -> Arc<Node> {
     let mut removed_size = 0u64;
     let mut removed_files = 0u64;
@@ -1947,7 +2118,56 @@ const _: usize = MAX_RINGS;
 
 #[cfg(test)]
 mod tests {
-    use super::breadcrumb_segments;
+    use super::*;
+    use crate::model::{Kind, Node};
+
+    fn folder(name: &str, path: &str, size: u64, children: Vec<Arc<Node>>) -> Arc<Node> {
+        Arc::new(Node {
+            name: name.to_string(),
+            path: path.to_string(),
+            size,
+            files: 10,
+            dirs: 2,
+            kind: Kind::Dir,
+            children,
+        })
+    }
+
+    #[test]
+    fn splices_a_refreshed_folder_and_moves_its_difference_up() {
+        let users = folder("Users", r"C:\Users", 100, Vec::new());
+        let windows = folder("Windows", r"C:\Windows", 50, Vec::new());
+        let root = folder(
+            "C:\\",
+            r"C:\",
+            150,
+            vec![users.clone(), windows.clone()],
+        );
+
+        let refreshed = folder("Users", r"C:\Users", 140, Vec::new());
+        let delta = Delta::between(&users, &refreshed);
+        let merged = splice(&root, r"C:\Users", &refreshed, delta).expect("Users is in the tree");
+
+        assert_eq!(merged.size, 190, "the volume total follows the delta");
+        assert_eq!(merged.children[0].size, 140, "the folder is replaced");
+        assert_eq!(merged.children[1].size, 50, "siblings are untouched");
+        assert_eq!(merged.children.len(), 2);
+    }
+
+    #[test]
+    fn splice_ignores_a_folder_that_is_not_in_the_tree() {
+        let root = folder("C:\\", r"C:\", 150, vec![folder("Users", r"C:\Users", 100, Vec::new())]);
+        let fresh = folder("Other", r"C:\Other", 5, Vec::new());
+        assert!(splice(&root, r"C:\Other", &fresh, Delta::default()).is_none());
+    }
+
+    #[test]
+    fn recognises_nested_paths() {
+        assert!(is_inside(r"C:\", r"C:\Users"));
+        assert!(is_inside(r"C:\Users", r"C:\Users\jcarillo"));
+        assert!(!is_inside(r"C:\Users", r"C:\UsersX"));
+        assert!(!is_inside(r"C:\Users", r"C:\Users"));
+    }
 
     #[test]
     fn splits_a_folder_path_into_clickable_levels() {

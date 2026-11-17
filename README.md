@@ -23,13 +23,16 @@ Scanner (Steffen Gerlach, 2012) but rebuilt as a native Rust app.
   *Delete folder* / *Delete file* (moves it to the Recycle Bin after a confirmation).
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
+- **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or
+  `F5` / `Ctrl+R`) re-walks just that subtree, marks the buttons, and pushes the size
+  difference back through the ancestors instead of re-reading the whole volume.
 - **Volume switching never blocks**: a volume already walked in this session is painted from
   memory the instant you click its chip, while the fresh scan runs behind the chart with a
   progress pill — the window never blanks out or forgets where you were.
 - **Auto / Dark / Light theme**: the `◐` toggle follows the Windows app theme by default and
   remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
-- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `Esc` closes the menu, dialog or tooltip
-  (or stops a running scan).
+- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `F5` / `Ctrl+R` rescan the open folder,
+  `Esc` closes the menu, dialog or tooltip (or stops a running scan).
 
 No webview: the window, the chart and the panels are drawn by GPUI directly.
 
@@ -93,6 +96,22 @@ scripts\rust-env.ps1 cargo build --release
 The app remembers the last scanned root in `%APPDATA%\disk-scanner\last-root.txt` and
 rescans it on start (falling back to the first fixed drive). Scans are cached per volume for the
 session, so switching between drives repaints instantly and refreshes behind the chart.
+
+### How fast the walk is
+
+Directories are listed with a single `FindFirstFileW`/`FindNextFileW` pass that already
+carries the file size and attributes, so no per-file `metadata` call is needed, and each
+directory's subdirectories are handed to `rayon` once there are four or more of them (at
+every depth, not only near the root). Measured on this 20-thread Windows 11 machine with a
+warm cache, using `cargo run --release --example scan -- <path>`:
+
+| Path | 1 thread | 20 threads |
+| --- | --- | --- |
+| `C:\` (3.25 M files, 532 K folders) | 21.8 s | 6.9 s |
+| `C:\Users\<you>\AppData\Local` (760 K files) | 3.8 s | 1.1 s |
+
+Parallelism stops paying off well before the core count: the walk is bound by directory
+metadata latency on a single volume, not by CPU.
 
 ### Running on a machine with several Visual Studio installs
 

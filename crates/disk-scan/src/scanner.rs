@@ -10,13 +10,14 @@
 //! * single-directory chains (`a/b/c`) are merged into one arc,
 //! * a global node budget guarantees a bounded payload.
 
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use rayon::prelude::*;
 use serde::Serialize;
-use std::os::windows::fs::MetadataExt;
 
 /// `FILE_ATTRIBUTE_REPARSE_POINT` — junctions, mount points and friends.
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
@@ -122,6 +123,96 @@ pub fn scan(root: &Path, cancel: &AtomicBool, counters: &ScanCounters) -> Result
     Ok(walk(root, cancel, counters, 0))
 }
 
+/// What one directory listing turned up, without touching the filesystem again.
+struct Listing {
+    subdirs: Vec<PathBuf>,
+    /// Only files at or above [`FILE_FLOOR`], so the caller never allocates for
+    /// entries that can never become an arc.
+    files: Vec<(u64, PathBuf)>,
+    files_seen: u64,
+    bytes: u64,
+    errors: u64,
+}
+
+/// Read a directory through `FindFirstFileW`, which returns the attributes and
+/// the size together. `std::fs::read_dir` + `DirEntry::metadata` costs a second
+/// syscall per entry, and a system drive has millions of them.
+fn list_dir(dir: &Path) -> Option<Listing> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
+        WIN32_FIND_DATAW,
+    };
+
+    let pattern = format!("{}\\*", verbatim(dir).to_string_lossy());
+    let wide: Vec<u16> = pattern.encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let mut listing = Listing {
+        subdirs: Vec::new(),
+        files: Vec::new(),
+        files_seen: 0,
+        bytes: 0,
+        errors: 0,
+    };
+    // Reused for every entry of this directory: building a `PathBuf` per file
+    // would allocate millions of times on a system drive, and only the entries
+    // that survive the filters actually need to keep their path.
+    let mut joined = PathBuf::with_capacity(dir.as_os_str().len() + 64);
+
+    loop {
+        let end = data
+            .cFileName
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(data.cFileName.len());
+        let name = &data.cFileName[..end];
+        let is_dot = end == 1 && name[0] == b'.' as u16;
+        let is_dot_dot = end == 2 && name[0] == b'.' as u16 && name[1] == b'.' as u16;
+
+        if end > 0 && !is_dot && !is_dot_dot {
+            let attributes = data.dwFileAttributes;
+            if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                // Symlinks, junctions, mount points and dedup stubs are skipped
+                // whole: following them double-counts bytes (`Users\All Users`
+                // -> `ProgramData`) and can walk in circles.
+                if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
+                    joined.clear();
+                    joined.push(dir);
+                    joined.push(OsString::from_wide(name));
+                    listing.subdirs.push(joined.clone());
+                }
+            } else {
+                // A file. Reparse-point files (dedup stubs, file symlinks) are
+                // counted like any other entry: their reported size is the
+                // logical size Explorer shows.
+                let size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+                listing.files_seen += 1;
+                listing.bytes += size;
+                if size >= FILE_FLOOR {
+                    joined.clear();
+                    joined.push(dir);
+                    joined.push(OsString::from_wide(name));
+                    listing.files.push((size, joined.clone()));
+                }
+            }
+        }
+
+        if unsafe { FindNextFileW(handle, &mut data) } == 0 {
+            break;
+        }
+    }
+    unsafe { FindClose(handle) };
+
+    Some(listing)
+}
+
+
 fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) -> RawNode {
     let mut node = RawNode {
         name: node_name(dir),
@@ -147,81 +238,42 @@ fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) 
         }
     }
 
-    let reader = match std::fs::read_dir(verbatim(dir)) {
-        Ok(reader) => reader,
-        Err(_) => {
+    // One `FindFirstFileW` pass gives names, attributes and sizes together.
+    let listing = match list_dir(dir) {
+        Some(listing) => listing,
+        None => {
             // Not readable (protected, in use, ...) — skip silently but count it.
             counters.errors.fetch_add(1, Ordering::Relaxed);
             return node;
         }
     };
 
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    let mut files: Vec<(String, String, u64)> = Vec::new();
+    node.size = listing.bytes;
+    node.files = listing.files_seen;
+    node.direct_files = listing.files_seen;
 
-    for entry in reader {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                counters.errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-        // `file_type` comes from the directory entry itself: cheap and it does
-        // not follow reparse points, which is exactly what we need to spot
-        // junctions/symlinks before recursing into a cycle.
-        let file_type = match entry.file_type() {
-            Ok(file_type) => file_type,
-            Err(_) => {
-                counters.errors.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-        };
-
-        // Symlinks and every other kind of reparse point (junctions, mount
-        // points, dedup stubs) are skipped wholesale: following them
-        // double-counts bytes (`Users\All Users` -> `ProgramData`) and can walk
-        // in circles. `DirEntry::metadata` does not traverse the link itself.
-        if file_type.is_symlink() {
-            continue;
-        }
-
-        if file_type.is_dir() {
-            let reparse = entry
-                .metadata()
-                .map(|meta| meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-                .unwrap_or(false);
-            if reparse {
-                continue;
-            }
-            counters.dirs.fetch_add(1, Ordering::Relaxed);
-            subdirs.push(entry.path());
-        } else {
-            let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
-            node.size += len;
-            node.files += 1;
-            node.direct_files += 1;
-            if len >= FILE_FLOOR {
-                files.push((
-                    entry.file_name().to_string_lossy().into_owned(),
-                    entry.path().to_string_lossy().into_owned(),
-                    len,
-                ));
-            }
-            counters.files.fetch_add(1, Ordering::Relaxed);
-            counters.bytes.fetch_add(len, Ordering::Relaxed);
-        }
+    // Bumped once per directory instead of once per entry: a system drive has
+    // millions of files and every atomic there is a locked instruction.
+    counters.dirs.fetch_add(listing.subdirs.len() as u64, Ordering::Relaxed);
+    counters.files.fetch_add(listing.files_seen, Ordering::Relaxed);
+    counters.bytes.fetch_add(listing.bytes, Ordering::Relaxed);
+    if listing.errors > 0 {
+        counters.errors.fetch_add(listing.errors, Ordering::Relaxed);
     }
 
-    // Parallelise where there is actually something to split. Deep single-child
-    // chains stay sequential: spawning tasks there costs more than it saves.
-    let mut children: Vec<RawNode> = if subdirs.len() > 1 && depth < 6 {
-        subdirs
+    // Split whenever a directory actually branches. Rayon steals the work, so
+    // deep trees get walked by every core instead of only the first few levels;
+    // a two-entry directory costs a handful of microseconds to split, which is
+    // nothing next to the two directory reads it then does in parallel.
+    let mut children: Vec<RawNode> = if listing.subdirs.len() >= 4 {
+        listing
+            .subdirs
             .par_iter()
             .map(|subdir| walk(subdir, cancel, counters, depth + 1))
             .collect()
     } else {
-        subdirs
+        listing
+            .subdirs
             .iter()
             .map(|subdir| walk(subdir, cancel, counters, depth + 1))
             .collect()
@@ -229,11 +281,16 @@ fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) 
 
     // Only the biggest files earn their own arc; everything else stays folded
     // into the parent's size, which keeps the payload small on file-heavy trees.
-    files.sort_by(|a, b| b.2.cmp(&a.2));
-    for (name, path, size) in files.into_iter().take(MAX_FILE_SLICES) {
+    let mut files = listing.files;
+    files.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (size, path) in files.into_iter().take(MAX_FILE_SLICES) {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
         children.push(RawNode {
             name,
-            path,
+            path: display_path(&path),
             size,
             files: 1,
             direct_files: 1,
