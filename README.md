@@ -20,7 +20,13 @@ Scanner (Steffen Gerlach, 2012) but rebuilt as a native Rust app.
   *Delete folder* / *Delete file* (moves it to the Recycle Bin after a confirmation).
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
-- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `Esc` closes the menu, dialog or tooltip.
+- **Volume switching never blocks**: a volume already walked in this session is painted from
+  memory the instant you click its chip, while the fresh scan runs behind the chart with a
+  progress pill — the window never blanks out or forgets where you were.
+- **Auto / Dark / Light theme**: the `◐` toggle follows the Windows app theme by default and
+  remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
+- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `Esc` closes the menu, dialog or tooltip
+  (or stops a running scan).
 
 No webview: the window, the chart and the panels are drawn by GPUI directly.
 
@@ -47,7 +53,6 @@ crates/disk-scan/
   src/drives.rs  Win32 volume enumeration (GetLogicalDrives, GetDiskFreeSpaceExW, …)
 scripts/
   rust-env.ps1   runs cargo inside a working Visual Studio developer environment
-  make_icon.py   regenerates the sunburst app icon set
 ```
 
 ### How the tree is made
@@ -83,7 +88,8 @@ scripts\rust-env.ps1 cargo build --release
 ```
 
 The app remembers the last scanned root in `%APPDATA%\disk-scanner\last-root.txt` and
-rescans it on start (falling back to the first fixed drive).
+rescans it on start (falling back to the first fixed drive). Scans are cached per volume for the
+session, so switching between drives repaints instantly and refreshes behind the chart.
 
 ### Running on a machine with several Visual Studio installs
 

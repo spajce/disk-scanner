@@ -6,6 +6,38 @@ use windows_sys::Win32::UI::Shell::{
     FOF_NOERRORUI, FOF_SILENT,
 };
 
+/// True when Windows is set to light mode for apps
+/// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` →
+/// `AppsUseLightTheme`). Unreadable keys fall back to the dark default.
+pub fn system_prefers_light() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
+    };
+
+    let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+        .encode_utf16()
+        .collect();
+    let value: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
+
+    let mut data: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let mut kind: u32 = 0;
+    // SAFETY: the two strings are NUL-terminated UTF-16 buffers that outlive the
+    // call, and `data`/`size` describe a writable u32 for a DWORD query.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            &mut kind,
+            &mut data as *mut u32 as *mut core::ffi::c_void,
+            &mut size,
+        )
+    };
+    status == 0 && data != 0
+}
+
 /// Reveal `path` in Explorer, selecting it when it is a file.
 pub fn reveal(path: &str) {
     let status = if std::path::Path::new(path).is_dir() {

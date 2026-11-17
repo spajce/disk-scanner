@@ -1,6 +1,6 @@
 //! The disk-scanner window: a sunburst you can zoom, plus a breakdown panel.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +62,13 @@ struct Placed {
     geom: Geom,
 }
 
+/// A finished scan kept around so switching back to a drive is instant.
+struct Cached {
+    tree: Arc<Node>,
+    elapsed: f64,
+    at: Instant,
+}
+
 pub struct DiskApp {
     drives: Vec<DriveInfo>,
     tree: Option<Arc<Node>>,
@@ -80,6 +87,11 @@ pub struct DiskApp {
     last_root: String,
     note: Option<String>,
     focus_handle: FocusHandle,
+    /// One entry per drive root (lower-cased), so re-visiting a disk repaints
+    /// from memory instead of starting from a blank window.
+    cache: HashMap<String, Cached>,
+    theme_mode: theme::Mode,
+    system_dark: bool,
 }
 
 impl DiskApp {
@@ -96,6 +108,9 @@ impl DiskApp {
             origin: point(px(0.), px(0.)),
             geom: Geom::new(600.0, 1),
         }));
+        let theme_mode = load_theme_mode().unwrap_or(theme::Mode::System);
+        let system_dark = !crate::sys::system_prefers_light();
+        theme::apply(theme_mode, system_dark);
         let mut app = DiskApp {
             drives,
             tree: None,
@@ -114,7 +129,34 @@ impl DiskApp {
             last_root: last_root.clone(),
             note: None,
             focus_handle: cx.focus_handle(),
+            cache: HashMap::new(),
+            theme_mode,
+            system_dark,
         };
+
+        // Follow the OS while the skin is on "Auto": the registry value changes
+        // when the user flips Windows between light and dark.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_secs(3))
+                .await;
+            let changed = this.update(cx, |this, cx| {
+                if this.theme_mode != theme::Mode::System {
+                    return;
+                }
+                let now_dark = !crate::sys::system_prefers_light();
+                if now_dark != this.system_dark {
+                    this.system_dark = now_dark;
+                    theme::apply(this.theme_mode, this.system_dark);
+                    cx.notify();
+                }
+            });
+            if changed.is_err() {
+                break;
+            }
+        })
+        .detach();
+
         app.start_scan(last_root, cx);
         app
     }
@@ -166,6 +208,81 @@ impl DiskApp {
         cx.notify();
     }
 
+    /// Switch to a drive without blanking the window: a recent scan of that
+    /// volume is shown immediately, otherwise the chart stays on screen while
+    /// the new scan streams its progress in.
+    fn switch_to(&mut self, root: String, cx: &mut Context<Self>) {
+        let key = cache_key(&root);
+        if let Some(cached) = self.cache.get(&key) {
+            if cached.at.elapsed() < Duration::from_secs(120) {
+                let tree = cached.tree.clone();
+                let elapsed = cached.elapsed;
+                if let Some(job) = &self.job {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+                self.job = None;
+                self.generation += 1;
+                let same_root = self.last_root.eq_ignore_ascii_case(&root);
+                let focus = if same_root && !self.focus_path.is_empty() {
+                    Node::find(&tree, &self.focus_path).unwrap_or_else(|| tree.clone())
+                } else {
+                    tree.clone()
+                };
+                self.tree = Some(tree.clone());
+                self.focus_path = focus.path.clone();
+                self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+                self.phase = Phase::Ready {
+                    elapsed,
+                    files: tree.files,
+                    bytes: tree.size,
+                };
+                self.last_root = root.clone();
+                save_last_root(&root);
+                self.hover = None;
+                self.tooltip = None;
+                self.menu = None;
+                self.confirm = None;
+                self.note = None;
+                cx.notify();
+                return;
+            }
+        }
+        self.start_scan(root, cx);
+    }
+
+    fn set_theme_mode(&mut self, mode: theme::Mode, cx: &mut Context<Self>) {
+        self.theme_mode = mode;
+        theme::apply(mode, self.system_dark);
+        save_theme_mode(mode);
+        cx.notify();
+    }
+
+    fn cancel_scan(&mut self, cx: &mut Context<Self>) {
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        if self.job.is_none() && !matches!(self.phase, Phase::Scanning) {
+            return;
+        }
+        self.job = None;
+        self.generation += 1;
+        self.phase = match self.cache.get(&cache_key(&self.last_root)) {
+            Some(cached) => Phase::Ready {
+                elapsed: cached.elapsed,
+                files: cached.tree.files,
+                bytes: cached.tree.size,
+            },
+            None if self.chart.is_some() => Phase::Ready {
+                elapsed: 0.0,
+                files: 0,
+                bytes: 0,
+            },
+            None => Phase::Empty,
+        };
+        self.note = Some("Scan stopped".to_string());
+        cx.notify();
+    }
+
     fn start_scan(&mut self, root: String, cx: &mut Context<Self>) {
         if let Some(job) = &self.job {
             job.cancel.store(true, Ordering::Relaxed);
@@ -185,8 +302,23 @@ impl DiskApp {
         self.menu = None;
         self.confirm = None;
         self.note = None;
+        let same_root = self.last_root.eq_ignore_ascii_case(&root);
         self.last_root = root.clone();
         save_last_root(&root);
+
+        // A drive we have already walked is painted from memory straight away;
+        // the scan then runs behind it and refreshes the numbers in place.
+        if let Some(cached) = self.cache.get(&cache_key(&root)) {
+            let tree = cached.tree.clone();
+            let focus = if same_root && !self.focus_path.is_empty() {
+                Node::find(&tree, &self.focus_path).unwrap_or_else(|| tree.clone())
+            } else {
+                tree.clone()
+            };
+            self.focus_path = focus.path.clone();
+            self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+            self.tree = Some(tree);
+        }
         cx.notify();
 
         // Progress: a cheap snapshot every 120 ms, so the UI stays live while
@@ -249,7 +381,19 @@ impl DiskApp {
         match result {
             Ok((tree, elapsed, cancelled)) => {
                 if cancelled {
-                    self.phase = Phase::Empty;
+                    // This walk was superseded; keep whatever is on screen.
+                    match self.cache.get(&cache_key(&self.last_root)) {
+                        Some(cached) => {
+                            let (elapsed, files, bytes) =
+                                (cached.elapsed, cached.tree.files, cached.tree.size);
+                            self.phase = Phase::Ready {
+                                elapsed,
+                                files,
+                                bytes,
+                            };
+                        }
+                        None => self.phase = Phase::Empty,
+                    }
                     cx.notify();
                     return;
                 }
@@ -260,9 +404,29 @@ impl DiskApp {
                     files: tree.files,
                     bytes: tree.size,
                 };
+                self.cache.insert(
+                    cache_key(&self.last_root),
+                    Cached {
+                        tree: tree.clone(),
+                        elapsed,
+                        at: Instant::now(),
+                    },
+                );
                 self.tree = Some(tree);
             }
-            Err(error) => self.phase = Phase::Failed(error),
+            Err(error) => match self.cache.get(&cache_key(&self.last_root)) {
+                Some(cached) => {
+                    let (elapsed, files, bytes) =
+                        (cached.elapsed, cached.tree.files, cached.tree.size);
+                    self.phase = Phase::Ready {
+                        elapsed,
+                        files,
+                        bytes,
+                    };
+                    self.note = Some(error);
+                }
+                None => self.phase = Phase::Failed(error),
+            },
         }
         cx.notify();
     }
@@ -371,10 +535,33 @@ impl DiskApp {
                     .child(self.metric_button("Size", Metric::Bytes, cx))
                     .child(self.metric_button("Files", Metric::Files, cx)),
             )
+            .child(self.theme_button(cx))
             .child(self.action_button("Rescan", cx, |this, cx| {
                 let root = this.last_root.clone();
                 this.start_scan(root, cx);
             }))
+    }
+
+    fn theme_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let mode = self.theme_mode;
+        let label = format!("◐ {}", mode.label());
+        div()
+            .id("theme-toggle")
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .text_color(theme::text_dim())
+            .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_theme_mode(mode.next(), cx);
+            }))
+            .child(label)
     }
 
     fn drive_chip(
@@ -415,7 +602,12 @@ impl DiskApp {
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_alt()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.start_scan(root.clone(), cx);
+                if this.last_root.eq_ignore_ascii_case(&root) {
+                    // Clicking the live drive is an explicit "refresh this".
+                    this.start_scan(root.clone(), cx);
+                } else {
+                    this.switch_to(root.clone(), cx);
+                }
             }))
             .child(
                 div()
@@ -513,12 +705,17 @@ impl DiskApp {
         let available_w = content_w - PANEL_W - GAP;
         let side = available_w.min(content_h).max(240.0) - 4.0;
 
+        let scanning = matches!(self.phase, Phase::Scanning);
+
         let Some(chart) = self.chart.clone() else {
-            return div().flex_1().flex().items_center().justify_center().child(
-                div()
-                    .text_color(theme::text_faint())
-                    .child("Waiting for the first scan…"),
-            );
+            return div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.scan_card(cx));
         };
 
         let rings = chart.rings;
@@ -590,7 +787,8 @@ impl DiskApp {
         let store_prepaint = placed.clone();
         let chart_paint = chart.clone();
         let store_paint = placed.clone();
-        div()
+        let mut area = div()
+            .relative()
             .flex_1()
             .min_w_0()
             .flex()
@@ -670,7 +868,115 @@ impl DiskApp {
                             this.on_chart_right_click(event, cx);
                         }),
                     ),
+            );
+        // While a *different* volume is being walked, the chart on screen is
+        // yesterday's news: veil it so nobody reads C: numbers as G: numbers.
+        if scanning && !chart.focus.path.eq_ignore_ascii_case(&self.last_root) {
+            area = area.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w_full()
+                    .h_full()
+                    .bg(theme::scrim()),
+            );
+        }
+        if scanning {
+            area = area.child(self.scan_pill(cx));
+        }
+        area
+    }
+
+    /// The floating progress pill shown over a chart while its numbers are
+    /// being refreshed.
+    fn scan_pill(&self, cx: &mut Context<Self>) -> Div {
+        let (files, bytes, path) = &self.progress;
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .pl(px(13.0))
+                    .pr(px(5.0))
+                    .py(px(5.0))
+                    .max_w(px(560.0))
+                    .rounded_full()
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .text_size(px(11.0))
+                    .text_color(theme::text_dim())
+                    .child(div().text_color(theme::accent()).child("●"))
+                    .child(
+                        div().truncate().child(format!(
+                            "Scanning {} · {} files · {}",
+                            short_name(path, 38),
+                            theme::format_count(*files),
+                            theme::format_bytes(*bytes)
+                        )),
+                    )
+                    .child(self.action_button("Stop", cx, |this, cx| this.cancel_scan(cx))),
             )
+    }
+
+    /// The full-card placeholder used before any scan has produced a chart.
+    fn scan_card(&self, cx: &mut Context<Self>) -> Div {
+        let (files, bytes, path) = &self.progress;
+        let scanning = matches!(self.phase, Phase::Scanning);
+        let title = match &self.phase {
+            Phase::Scanning => format!("Scanning {}…", self.last_root),
+            Phase::Failed(error) => format!("Could not scan: {error}"),
+            Phase::Ready { .. } => "Waiting for the first scan…".to_string(),
+            Phase::Empty => "Waiting for a drive…".to_string(),
+        };
+        let mut card = div()
+            .w(px(440.0))
+            .p(px(20.0))
+            .rounded(px(12.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child(title),
+            );
+        if scanning {
+            card = card
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme::text_dim())
+                        .child(format!(
+                            "{} files · {}",
+                            theme::format_count(*files),
+                            theme::format_bytes(*bytes)
+                        )),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme::text_faint())
+                        .truncate()
+                        .child(short_name(path, 60)),
+                )
+                .child(self.action_button("Stop", cx, |this, cx| this.cancel_scan(cx)));
+        }
+        card
     }
 
     fn pick(&self, position: Point<Pixels>) -> Option<(usize, f32, f32)> {
@@ -743,6 +1049,8 @@ impl DiskApp {
                     self.confirm = None;
                 } else if self.menu.is_some() {
                     self.menu = None;
+                } else if matches!(self.phase, Phase::Scanning) {
+                    self.cancel_scan(cx);
                 } else {
                     self.hover = None;
                     self.tooltip = None;
@@ -1162,7 +1470,7 @@ impl DiskApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(gpui::rgba(0x05070bcc))
+                    .bg(theme::scrim())
                     .child(
                         div()
                             .w(px(420.0))
@@ -1227,43 +1535,6 @@ impl DiskApp {
                                             .child("Delete"),
                                     ),
                             ),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        if matches!(self.phase, Phase::Scanning) {
-            let (files, bytes, path) = &self.progress;
-            layers.push(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(TOPBAR_H))
-                    .w_full()
-                    .h(px(52.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .px(px(14.0))
-                            .py(px(7.0))
-                            .rounded(px(10.0))
-                            .bg(theme::surface_alt())
-                            .border_1()
-                            .border_color(theme::hairline())
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .text_size(px(11.0))
-                            .text_color(theme::text_dim())
-                            .child(div().text_color(theme::accent()).child("●"))
-                            .child(format!(
-                                "{} files · {} · {}",
-                                theme::format_count(*files),
-                                theme::format_bytes(*bytes),
-                                short_name(path, 60)
-                            )),
                     )
                     .into_any_element(),
             );
@@ -1471,6 +1742,33 @@ fn save_last_root(root: &str) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, root);
+}
+
+fn cache_key(root: &str) -> String {
+    root.replace('/', "\\").to_lowercase()
+}
+
+fn theme_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var("APPDATA").ok()?;
+    Some(
+        std::path::PathBuf::from(appdata)
+            .join("disk-scanner")
+            .join("theme.txt"),
+    )
+}
+
+fn load_theme_mode() -> Option<theme::Mode> {
+    let path = theme_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    theme::Mode::parse(&text)
+}
+
+fn save_theme_mode(mode: theme::Mode) {
+    let Some(path) = theme_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, mode.as_str());
 }
 
 impl Render for DiskApp {
