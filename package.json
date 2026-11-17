@@ -1,0 +1,25 @@
+{
+  "name": "disk-scanner",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Sunburst disk usage explorer — Rust + TypeScript desktop app",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "tauri": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/rust-env.ps1 tauri",
+    "cargo": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/rust-env.ps1 cargo",
+    "test:rust": "pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/rust-env.ps1 cargo test --manifest-path src-tauri/Cargo.toml",
+    "test": "pnpm typecheck && pnpm test:rust"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}

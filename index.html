@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Disk Scanner</title>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div class="brand-text">
+            <h1>Disk Scanner</h1>
+            <p>Sunburst disk usage</p>
+          </div>
+        </div>
+
+        <nav class="drives" id="drives" aria-label="Volumes"></nav>
+
+        <div class="top-actions">
+          <button id="btn-up" class="btn ghost" type="button" title="Zoom out (Backspace)">
+            Up
+          </button>
+          <button id="btn-rescan" class="btn" type="button" title="Scan the current root again">
+            Rescan
+          </button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="chart-card">
+          <div class="chart-head">
+            <div class="crumbs" id="crumbs"></div>
+            <div class="segmented" id="metric-toggle" role="group" aria-label="Ring weighting">
+              <button type="button" data-metric="size" class="active">Size</button>
+              <button type="button" data-metric="files">Files</button>
+            </div>
+          </div>
+
+          <div class="chart-stage" id="chart-stage">
+            <svg id="chart" xmlns="http://www.w3.org/2000/svg"></svg>
+
+            <div class="scan-overlay" id="scan-overlay" hidden>
+              <div class="scan-card">
+                <div class="spinner" aria-hidden="true"></div>
+                <div class="scan-title">Scanning <span id="scan-root">…</span></div>
+                <div class="scan-numbers" id="scan-numbers">0 files</div>
+                <div class="scan-bytes" id="scan-bytes">0 B</div>
+                <div class="scan-path" id="scan-path"></div>
+                <button class="btn ghost" id="btn-cancel" type="button">Cancel</button>
+              </div>
+            </div>
+
+            <div class="empty" id="empty" hidden>
+              <h2>Nothing scanned yet</h2>
+              <p>Pick a volume above, or scan a folder to explore its sunburst.</p>
+              <div class="empty-actions">
+                <label class="path-field">
+                  <span>Folder</span>
+                  <input id="path-input" type="text" spellcheck="false" placeholder="D:\\Media" />
+                </label>
+                <button class="btn" id="btn-scan-path" type="button">Scan folder</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <aside class="panel">
+          <section class="panel-block detail" id="detail"></section>
+          <section class="panel-block breakdown">
+            <div class="panel-title">
+              <h2>Breakdown</h2>
+              <span class="hint" id="breakdown-hint"></span>
+            </div>
+            <div class="bars" id="bars"></div>
+          </section>
+        </aside>
+      </main>
+
+      <footer class="statusbar">
+        <span id="status">Starting…</span>
+        <span id="status-right"></span>
+      </footer>
+
+      <div class="tooltip" id="tooltip" hidden></div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
