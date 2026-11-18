@@ -21,6 +21,13 @@ use serde::Serialize;
 
 /// `FILE_ATTRIBUTE_REPARSE_POINT` — junctions, mount points and friends.
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+/// Entries whose on-disk footprint can be smaller (or larger) than their
+/// logical length: sparse files, NTFS-compressed files, and cloud
+/// placeholders that only hold metadata locally.
+const TIGHTLY_PACKED_ATTRIBUTES: u32 = 0x0200 | 0x0800 | 0x0040_0000 | 0x1000;
+/// Only files this big are checked for hard links: opening a handle costs about
+/// as much as listing a directory, and linking a 40 KiB file is not worth it.
+const DEDUPE_FLOOR: u64 = 8 * 1024 * 1024;
 
 /// How deep the compacted payload may go.
 const MAX_DEPTH: usize = 16;
@@ -33,7 +40,7 @@ const ABS_FLOOR: f64 = 0.000_08;
 /// Relative floor: fraction of its parent a slice needs to be kept.
 const REL_FLOOR: f64 = 0.001;
 /// Global budget for kept nodes in the payload.
-const NODE_BUDGET: usize = 80_000;
+const NODE_BUDGET: usize = 160_000;
 /// Files smaller than this are never drawn as their own arc.
 const FILE_FLOOR: u64 = 64 * 1024;
 /// At most this many file arcs per directory (the biggest ones).
@@ -47,6 +54,9 @@ pub struct ScanCounters {
     pub errors: AtomicU64,
     current: Mutex<String>,
     visited: AtomicU64,
+    /// Identity of the large files already counted, so a hard link does not
+    /// add its bytes twice when both names are walked.
+    links: Mutex<std::collections::HashSet<(u64, u64)>>,
 }
 
 impl Default for ScanCounters {
@@ -64,6 +74,7 @@ impl ScanCounters {
             errors: AtomicU64::new(0),
             current: Mutex::new(String::new()),
             visited: AtomicU64::new(0),
+            links: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -137,8 +148,77 @@ struct Listing {
 /// Read a directory through `FindFirstFileW`, which returns the attributes and
 /// the size together. `std::fs::read_dir` + `DirEntry::metadata` costs a second
 /// syscall per entry, and a system drive has millions of them.
-fn list_dir(dir: &Path) -> Option<Listing> {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+/// `true` when this file's bytes have not been counted yet, `false` when it is
+/// another name for a file already walked. Files with a single link are never
+/// remembered, so the set only ever holds the genuinely shared ones.
+fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = verbatim(path)
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // No access rights: the metadata is available from the handle alone.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return true;
+    }
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
+    unsafe { CloseHandle(handle) };
+    if !ok || info.nNumberOfLinks <= 1 {
+        return true;
+    }
+
+    let identity = (
+        info.dwVolumeSerialNumber as u64,
+        ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
+    );
+    match links.lock() {
+        Ok(mut set) => set.insert(identity),
+        // A poisoned lock means another thread panicked; keep the bytes rather
+        // than silently dropping them from the totals.
+        Err(_) => true,
+    }
+}
+
+/// Size a file actually occupies on the volume, which is what Explorer and `df`
+/// report: sparse and compressed files take less, cloud placeholders take
+/// almost nothing until they are downloaded.
+fn allocated_size(path: &Path, logical: u64) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+    let wide: Vec<u16> = verbatim(path)
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut high: u32 = 0;
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    if low == u32::MAX && high == u32::MAX {
+        // INVALID_FILE_SIZE, e.g. a file that vanished between listing and this
+        // call — fall back to the logical length rather than dropping its bytes.
+        return logical;
+    }
+    ((high as u64) << 32) | low as u64
+}
+
+fn list_dir(dir: &Path) -> Option<Listing> {    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
         WIN32_FIND_DATAW,
@@ -191,15 +271,27 @@ fn list_dir(dir: &Path) -> Option<Listing> {
                 // A file. Reparse-point files (dedup stubs, file symlinks) are
                 // counted like any other entry: their reported size is the
                 // logical size Explorer shows.
-                let size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
-                listing.files_seen += 1;
-                listing.bytes += size;
-                if size >= FILE_FLOOR {
+                let mut size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+                // Sparse, NTFS-compressed and cloud placeholder files hold less
+                // on the disk than their logical length; ask the volume for the
+                // allocated size of just those, which are rare enough to keep
+                // the extra syscall off the hot path.
+                if attributes & TIGHTLY_PACKED_ATTRIBUTES != 0 {
                     joined.clear();
                     joined.push(dir);
                     joined.push(OsString::from_wide(name));
+                    size = allocated_size(&joined, size);
+                }
+                listing.files_seen += 1;
+                listing.bytes += size;
+                if size >= FILE_FLOOR {
+                    if joined.as_os_str().is_empty() {
+                        joined.push(dir);
+                        joined.push(OsString::from_wide(name));
+                    }
                     listing.files.push((size, joined.clone()));
                 }
+                joined.clear();
             }
         }
 
@@ -247,6 +339,24 @@ fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) 
             return node;
         }
     };
+
+    // A hard link is the same bytes under two names, so only the first name
+    // counts. Opening a handle is far too slow for millions of small files, so
+    // this runs only for files big enough to be worth a hard link in the first
+    // place — where a duplicate actually distorts the chart.
+    let mut listing = listing;
+    let mut deduped: u64 = 0;
+    let mut deduped_files: u64 = 0;
+    listing.files.retain(|(size, path)| {
+        if *size < DEDUPE_FLOOR || count_once(path, &counters.links) {
+            return true;
+        }
+        deduped += *size;
+        deduped_files += 1;
+        false
+    });
+    listing.bytes = listing.bytes.saturating_sub(deduped);
+    listing.files_seen = listing.files_seen.saturating_sub(deduped_files);
 
     node.size = listing.bytes;
     node.files = listing.files_seen;
@@ -356,18 +466,27 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     let rel_floor = ((current.size as f64) * REL_FLOOR) as u64;
 
     let mut kept: Vec<NodeDto> = Vec::new();
+    // The node budget is shared out between the remaining siblings instead of
+    // being spent depth-first: otherwise the first big child (almost always
+    // `Users`) eats the whole budget and its later siblings collapse into one
+    // huge "(n more)" bucket that hides most of the volume.
+    let mut remaining = *budget;
 
     for (index, child) in kids.iter().enumerate() {
         let wanted = depth < MAX_DEPTH
-            && *budget > 0
+            && remaining > 0
             && kept.len() < MAX_CHILDREN
             && (index < MIN_TOP || child.size >= abs_floor.max(rel_floor));
         if wanted {
-            kept.push(convert(child, total, depth + 1, budget));
+            let left = kids.len().saturating_sub(index).max(1);
+            let mut share = (remaining / left).max(1);
+            let granted = share;
+            kept.push(convert(child, total, depth + 1, &mut share));
+            remaining = remaining.saturating_sub(granted.saturating_sub(share));
         }
     }
 
-    *budget = budget.saturating_sub(1);
+    *budget = remaining.saturating_sub(1);
 
     // Everything without an arc of its own — children below the floors, children
     // over MAX_CHILDREN, and loose files under FILE_FLOOR — still has to be
@@ -507,6 +626,23 @@ mod tests {
         let dto = to_dto(&raw, raw.size);
         let sum: u64 = dto.children.iter().map(|child| child.size).sum();
         assert_eq!(sum, raw.size, "arcs must add up to the folder total");
+    }
+
+    #[test]
+    fn hard_links_are_counted_once() {
+        let tree = TempTree::new("links");
+        tree.file("original.bin", DEDUPE_FLOOR as usize);
+        // A second name for the same bytes: NTFS reports the same file size for
+        // both, but only one of them occupies space on the volume.
+        let original = tree.0.join("original.bin");
+        std::fs::hard_link(&original, tree.0.join("alias.bin")).unwrap();
+
+        let raw = scan_tree(&tree.0);
+        assert_eq!(
+            raw.size, DEDUPE_FLOOR,
+            "a hard link must not add its bytes twice"
+        );
+        assert_eq!(raw.files, 1, "a hard link must not add a second file");
     }
 
     #[test]

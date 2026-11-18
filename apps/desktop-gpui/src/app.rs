@@ -9,14 +9,18 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, point, px, AnyElement, App, Context, Div, FocusHandle, FontWeight, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, Render,
-    SharedString, Window, WindowOptions,
+    canvas, div, linear_color_stop, linear_gradient, point, px, quad, size, AnyElement, App, BorderStyle, Bounds,
+    Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, Render, SharedString, Window,
+    WindowOptions,
 };
 
 use disk_scan::{list_drives, scan, to_dto, DriveInfo, ScanCounters};
 
-use crate::model::{build_chart, hit, short_name, ChartModel, Geom, Kind, Metric, Node, MAX_RINGS};
+use crate::model::{
+    build_chart, heatmap, hit, log_rank, short_name, treemap, ChartModel, Geom, Kind, Metric, Node,
+    Tile, View, MAX_RINGS, TREEMAP_HEADER,
+};
 use crate::theme;
 
 const TOPBAR_H: f32 = 62.0;
@@ -60,6 +64,12 @@ struct Confirm {
 struct Placed {
     origin: Point<Pixels>,
     geom: Geom,
+    /// Treemap / heatmap cells for the frame on screen, indexed like
+    /// `ChartModel::slices`. Empty while the sunburst is showing.
+    tiles: Arc<Vec<Tile>>,
+    view: View,
+    /// Logical size of the drawing area measured during prepaint.
+    size: (f32, f32),
 }
 
 /// A finished scan kept around so switching back to a drive is instant.
@@ -92,6 +102,10 @@ pub struct DiskApp {
     cache: HashMap<String, Cached>,
     theme_mode: theme::Mode,
     system_dark: bool,
+    /// Sunburst, treemap or heatmap — three looks at the same tree.
+    view: View,
+    /// Canvas size the current tile labels were laid out for.
+    tile_size: (f32, f32),
 }
 
 impl DiskApp {
@@ -107,6 +121,9 @@ impl DiskApp {
         let placed = Arc::new(Mutex::new(Placed {
             origin: point(px(0.), px(0.)),
             geom: Geom::new(600.0, 1),
+            tiles: Arc::new(Vec::new()),
+            view: View::Rings,
+            size: (0.0, 0.0),
         }));
         let theme_mode = load_theme_mode().unwrap_or(theme::Mode::System);
         let system_dark = !crate::sys::system_prefers_light();
@@ -132,6 +149,8 @@ impl DiskApp {
             cache: HashMap::new(),
             theme_mode,
             system_dark,
+            view: initial_view(),
+            tile_size: (-1.0, -1.0),
         };
 
         // Follow the OS while the skin is on "Auto": the registry value changes
@@ -236,13 +255,13 @@ impl DiskApp {
         cx.notify();
     }
 
-    /// Switch to a drive without blanking the window: a recent scan of that
-    /// volume is shown immediately, otherwise the chart stays on screen while
-    /// the new scan streams its progress in.
+    /// Show a volume. A volume already walked in this session is painted from
+    /// memory and *not* re-scanned: switching disks should be instant, and a
+    /// refresh is the explicit Rescan / F5 action. Only a volume with no scan
+    /// yet starts walking straight away.
     fn switch_to(&mut self, root: String, cx: &mut Context<Self>) {
         let key = cache_key(&root);
         if let Some(cached) = self.cache.get(&key) {
-            if cached.at.elapsed() < Duration::from_secs(120) {
                 let tree = cached.tree.clone();
                 let elapsed = cached.elapsed;
                 if let Some(job) = &self.job {
@@ -270,16 +289,28 @@ impl DiskApp {
                 self.tooltip = None;
                 self.menu = None;
                 self.confirm = None;
-                self.note = None;
+                self.note = Some(format!(
+                    "Showing the scan from {} ago — Rescan to refresh",
+                    theme::format_seconds(cached.at.elapsed().as_secs_f64())
+                ));
                 cx.notify();
                 return;
-            }
         }
         self.start_scan(root, cx);
     }
 
-    fn set_theme_mode(&mut self, mode: theme::Mode, cx: &mut Context<Self>) {
-        self.theme_mode = mode;
+    /// Rings, treemap or heatmap over the same tree.
+    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.hover = None;
+        self.tooltip = None;
+        cx.notify();
+    }
+
+    fn set_theme_mode(&mut self, mode: theme::Mode, cx: &mut Context<Self>) {        self.theme_mode = mode;
         theme::apply(mode, self.system_dark);
         save_theme_mode(mode);
         cx.notify();
@@ -640,6 +671,15 @@ impl DiskApp {
                 div()
                     .flex()
                     .items_center()
+                    .gap(px(2.0))
+                    .child(self.view_button(View::Rings, cx))
+                    .child(self.view_button(View::Treemap, cx))
+                    .child(self.view_button(View::Heatmap, cx)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
                     .gap(px(6.0))
                     .child(self.metric_button("Size", Metric::Bytes, cx))
                     .child(self.metric_button("Files", Metric::Files, cx)),
@@ -723,10 +763,10 @@ impl DiskApp {
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_alt()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this.last_root.eq_ignore_ascii_case(&root) {
-                    // Clicking the live drive is an explicit "refresh this".
-                    this.start_scan(root.clone(), cx);
-                } else {
+                // Clicking a drive only *shows* it: a cached scan paints
+                // instantly and is not re-walked. The Rescan button is the
+                // explicit way to refresh.
+                if !this.last_root.eq_ignore_ascii_case(&root) {
                     this.switch_to(root.clone(), cx);
                 }
             }))
@@ -771,6 +811,49 @@ impl DiskApp {
                             .w(px(150.0 * fraction)),
                     ),
             )
+    }
+
+    fn view_button(&self, view: View, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let active = self.view == view;
+        let glyph = match view {
+            View::Rings => "◎",
+            View::Treemap => "▦",
+            View::Heatmap => "▩",
+        };
+        div()
+            .id(SharedString::from(format!("view-{glyph}")))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(if active {
+                theme::accent_soft()
+            } else {
+                theme::surface()
+            })
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::text_dim()
+            })
+            .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(if active {
+                        theme::accent()
+                    } else {
+                        theme::text_faint()
+                    })
+                    .child(glyph),
+            )
+            .child(view.label().to_string())
     }
 
     fn metric_button(&self, label: &str, metric: Metric, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
@@ -820,7 +903,13 @@ impl DiskApp {
             .child(label.to_string())
     }
 
-    fn chart_area(&mut self, viewport_w: f32, viewport_h: f32, cx: &mut Context<Self>) -> Div {
+    fn chart_area(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         let content_w = viewport_w - PAD * 2.0;
         let content_h = viewport_h - TOPBAR_H - STATUSBAR_H - PAD * 2.0;
         let available_w = content_w - PANEL_W - GAP;
@@ -838,6 +927,10 @@ impl DiskApp {
                 .justify_center()
                 .child(self.scan_card(cx));
         };
+
+        if self.view != View::Rings {
+            return self.tiles_area(&chart, scanning, window, cx);
+        }
 
         let rings = chart.rings;
         let geom = Geom::new(side, rings);
@@ -1009,6 +1102,170 @@ impl DiskApp {
         area
     }
 
+    /// Treemap and heatmap share one canvas: rectangles from the model painted
+    /// as quads, labels floated on top, and the same hover / click / menu
+    /// handling as the sunburst.
+    fn tiles_area(
+        &mut self,
+        chart: &Arc<ChartModel>,
+        scanning: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let view = self.view;
+        let hover = self.hover;
+        let chain = hover.map(|index| ancestors(chart, index)).unwrap_or_default();
+
+        // The canvas measures itself during prepaint; the labels for this
+        // frame are laid out from the size measured a moment earlier, so they
+        // line up with the cells painted underneath them.
+        let measured = self
+            .placed
+            .lock()
+            .map(|slot| slot.size)
+            .unwrap_or((0.0, 0.0));
+        let tiles: Arc<Vec<Tile>> = if measured.0 > 1.0 && measured.1 > 1.0 {
+            Arc::new(match view {
+                View::Heatmap => heatmap(chart, measured.0, measured.1),
+                _ => treemap(chart, measured.0, measured.1),
+            })
+        } else {
+            if measured != self.tile_size {
+                self.tile_size = measured;
+                window.request_animation_frame();
+            }
+            Arc::new(Vec::new())
+        };
+
+        let mut labels: Vec<AnyElement> = Vec::new();
+        // Parents keep a name strip at the top of their cell, so their label
+        // never collides with a child's; small parents get no label at all.
+        let mut has_children = vec![false; chart.slices.len()];
+        for slice in &chart.slices {
+            if slice.parent != usize::MAX {
+                has_children[slice.parent] = true;
+            }
+        }
+        let (min_w, min_h) = if view == View::Heatmap {
+            (36.0, 12.0)
+        } else {
+            (58.0, 16.0)
+        };
+        let mut ordered: Vec<usize> = (0..tiles.len().min(chart.slices.len())).collect();
+        ordered.sort_by(|&a, &b| tiles[b].area().total_cmp(&tiles[a].area()));
+        for &index in &ordered {
+            let tile = tiles[index];
+            let slice = &chart.slices[index];
+            if tile.w < min_w || tile.h < min_h {
+                continue;
+            }
+            if view != View::Heatmap
+                && has_children[index]
+                && (tile.h < TREEMAP_HEADER + 22.0 || tile.w < 40.0)
+            {
+                continue;
+            }
+            let dimmed = view != View::Heatmap && hover.is_some() && !chain.contains(&index);
+            let max_chars = ((tile.w - 6.0) / 5.4).clamp(3.0, 40.0) as usize;
+            labels.push(
+                div()
+                    .absolute()
+                    .left(px(tile.x + 4.0))
+                    .top(px(tile.y + 2.0))
+                    .w(px(tile.w - 8.0))
+                    .overflow_hidden()
+                    .text_size(px(9.5))
+                    .text_color(if dimmed {
+                        theme::text_faint()
+                    } else {
+                        theme::text()
+                    })
+                    .opacity(if dimmed { 0.55 } else { 0.9 })
+                    .child(short_name(&slice.node.name, max_chars))
+                    .into_any_element(),
+            );
+            if labels.len() >= 64 {
+                break;
+            }
+        }
+
+
+        let chart_prepaint = chart.clone();
+        let chart_paint = chart.clone();
+        let store_prepaint = self.placed.clone();
+        let paint_chain = chain.clone();
+
+        let mut area = div().relative().flex_1().min_w_0().child(
+            div()
+                .relative()
+                .w_full()
+                .h_full()
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            let w = f32::from(bounds.size.width).max(1.0);
+                            let h = f32::from(bounds.size.height).max(1.0);
+                            let tiles = Arc::new(match view {
+                                View::Heatmap => heatmap(&chart_prepaint, w, h),
+                                _ => treemap(&chart_prepaint, w, h),
+                            });
+                            if let Ok(mut slot) = store_prepaint.lock() {
+                                slot.origin = bounds.origin;
+                                slot.tiles = tiles.clone();
+                                slot.view = view;
+                                slot.size = (w, h);
+                            }
+                            tiles
+                        },
+                        move |bounds, tiles, window, _| {
+                            paint_tiles(
+                                window,
+                                bounds.origin,
+                                &tiles,
+                                &chart_paint,
+                                view,
+                                hover,
+                                &paint_chain,
+                            );
+                        },
+                    )
+                    .size_full(),
+                )
+                .children(labels)
+                .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                    this.on_chart_move(event, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.on_chart_click(event, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        this.on_chart_right_click(event, cx);
+                    }),
+                ),
+        );
+
+        if scanning && !chart.focus.path.eq_ignore_ascii_case(&self.last_root) {
+            area = area.child(
+                div()
+                    .absolute()
+                    .left(px(0.))
+                    .top(px(0.))
+                    .w_full()
+                    .h_full()
+                    .bg(theme::scrim()),
+            );
+        }
+        if scanning {
+            area = area.child(self.scan_pill(cx));
+        }
+        area
+    }
+
     /// The floating progress pill shown over a chart while its numbers are
     /// being refreshed.
     fn scan_pill(&self, cx: &mut Context<Self>) -> Div {
@@ -1105,7 +1362,18 @@ impl DiskApp {
         let slot = self.placed.lock().ok()?;
         let local_x = f32::from(position.x - slot.origin.x);
         let local_y = f32::from(position.y - slot.origin.y);
-        let index = hit(chart, &slot.geom, local_x, local_y)?;
+        let index = match slot.view {
+            View::Rings => hit(chart, &slot.geom, local_x, local_y),
+            // Nested treemap cells overlap: the smallest one under the cursor
+            // is the deepest folder, which is the one the user means.
+            _ => slot
+                .tiles
+                .iter()
+                .enumerate()
+                .filter(|(_, tile)| tile.contains(local_x, local_y))
+                .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
+                .map(|(index, _)| index),
+        }?;
         Some((index, f32::from(position.x), f32::from(position.y)))
     }
 
@@ -1124,16 +1392,21 @@ impl DiskApp {
         let Some(chart) = self.chart.clone() else {
             return;
         };
-        // A click inside the hub walks back up.
-        let in_hub = match self.placed.lock() {
-            Ok(slot) => {
-                let local_x = f32::from(event.position.x - slot.origin.x);
-                let local_y = f32::from(event.position.y - slot.origin.y);
-                let dx = local_x - slot.geom.cx;
-                let dy = local_y - slot.geom.cy;
-                (dx * dx + dy * dy).sqrt() < slot.geom.inner
+        // A click inside the hub walks back up (sunburst only — the flat views
+        // have no hub).
+        let in_hub = if self.view == View::Rings {
+            match self.placed.lock() {
+                Ok(slot) => {
+                    let local_x = f32::from(event.position.x - slot.origin.x);
+                    let local_y = f32::from(event.position.y - slot.origin.y);
+                    let dx = local_x - slot.geom.cx;
+                    let dy = local_y - slot.geom.cy;
+                    (dx * dx + dy * dy).sqrt() < slot.geom.inner
+                }
+                Err(_) => false,
             }
-            Err(_) => false,
+        } else {
+            false
         };
         if in_hub {
             self.go_up(cx);
@@ -1182,6 +1455,10 @@ impl DiskApp {
             // Refresh the folder in the focus card, or the volume at the root.
             "f5" => self.rescan_focus(cx),
             "r" if event.keystroke.modifiers.control => self.rescan_focus(cx),
+            // 1 / 2 / 3 pick the visualisation, like the toolbar buttons.
+            "1" => self.set_view(View::Rings, cx),
+            "2" => self.set_view(View::Treemap, cx),
+            "3" => self.set_view(View::Heatmap, cx),
             _ => {}
         }
     }
@@ -1810,6 +2087,96 @@ fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {
     set
 }
 
+/// Paint the treemap / heatmap cells. Treemap cells get a diagonal cushion
+/// gradient so nested rectangles read as separate blocks; heatmap cells are
+/// flat fills whose hue comes from the log of the item's weight.
+fn paint_tiles(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    tiles: &[Tile],
+    chart: &ChartModel,
+    view: View,
+    hover: Option<usize>,
+    chain: &HashSet<usize>,
+) {
+    let dimming = hover.is_some();
+
+    // Weight range for the heat ramp.
+    let mut min = f64::MAX;
+    let mut max = 0.0_f64;
+    let mut weights = Vec::with_capacity(chart.slices.len());
+    for slice in &chart.slices {
+        let weight = chart.metric.weight(&slice.node);
+        weights.push(weight);
+        min = min.min(weight);
+        max = max.max(weight);
+    }
+    if min == f64::MAX {
+        min = 0.0;
+    }
+
+    for (index, tile) in tiles.iter().enumerate() {
+        if tile.w < 0.6 || tile.h < 0.6 {
+            continue;
+        }
+        let slice = &chart.slices[index];
+        let mut color = match view {
+            View::Heatmap => theme::heat_color(log_rank(weights[index], min, max)),
+            _ => {
+                if slice.node.kind == Kind::Other {
+                    theme::rest_color(slice.depth)
+                } else {
+                    theme::slice_color(slice.hue, slice.depth)
+                }
+            }
+        };
+        // In the heatmap the colour *is* the measurement, so dimming would
+        // destroy the encoding; the hovered cell is outlined instead.
+        if dimming && view != View::Heatmap && !chain.contains(&index) {
+            color.a = 0.5;
+        } else if dimming {
+            color.a = 1.0;
+        }
+
+        let bounds = Bounds {
+            origin: point(origin.x + px(tile.x), origin.y + px(tile.y)),
+            size: size(px(tile.w), px(tile.h)),
+        };
+        let background = match view {
+            View::Treemap => {
+                let light = Hsla {
+                    l: (color.l + 0.07).min(1.0),
+                    ..color
+                };
+                let dark = Hsla {
+                    l: (color.l - 0.09).max(0.0),
+                    ..color
+                };
+                linear_gradient(135.0, linear_color_stop(light, 0.0), linear_color_stop(dark, 1.0))
+            }
+            _ => gpui::Background::from(color),
+        };
+        let border = Hsla {
+            l: (color.l * 0.4).max(0.02),
+            a: 0.85,
+            ..color
+        };
+        let (width, stroke) = if view == View::Heatmap && hover == Some(index) {
+            (1.5, Hsla { l: 0.96, s: 0.0, h: 0.0, a: 0.95 })
+        } else {
+            (0.5, border)
+        };
+        window.paint_quad(quad(
+            bounds,
+            px(0.0),
+            background,
+            px(width),
+            stroke,
+            BorderStyle::Solid,
+        ));
+    }
+}
+
 fn paint_sunburst(
     window: &mut Window,
     origin: Point<Pixels>,
@@ -2048,6 +2415,36 @@ fn save_theme_mode(mode: theme::Mode) {
     let _ = std::fs::write(path, mode.as_str());
 }
 
+/// The view to start in: an explicit DISK_SCANNER_VIEW wins (handy for
+/// screenshots), then whatever was last used, then the sunburst.
+fn initial_view() -> View {
+    std::env::var("DISK_SCANNER_VIEW")
+        .ok()
+        .and_then(|value| View::parse(&value))
+        .or_else(load_view)
+        .unwrap_or(View::Rings)
+}
+
+fn view_path() -> Option<std::path::PathBuf> {
+    let mut path = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
+    path.push("disk-scanner");
+    path.push("view.txt");
+    Some(path)
+}
+
+fn load_view() -> Option<View> {
+    let text = std::fs::read_to_string(view_path()?).ok()?;
+    View::parse(&text)
+}
+
+fn save_view(view: View) {
+    let Some(path) = view_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, view.as_str());
+}
+
 impl Render for DiskApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
@@ -2078,7 +2475,7 @@ impl Render for DiskApp {
                     .flex_row()
                     .gap(px(GAP))
                     .px(px(PAD))
-                    .child(self.chart_area(viewport_w, viewport_h, cx))
+                    .child(self.chart_area(viewport_w, viewport_h, window, cx))
                     .child(self.panel(cx)),
             )
             .child(self.status_bar());

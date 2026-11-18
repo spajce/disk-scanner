@@ -1,38 +1,50 @@
 # Disk Scanner
 
-A desktop disk-usage explorer that renders a whole volume as a zoomable **sunburst** —
-every folder level at once, sized by bytes or by file count, in the spirit of the classic
-Scanner (Steffen Gerlach, 2012) but rebuilt as a native Rust app.
+A desktop disk-usage explorer that renders a whole volume three ways — a zoomable
+**sunburst**, a cushion-shaded **treemap**, and a log-scaled **heatmap** — every folder
+level at once, sized by bytes or by file count, in the spirit of the classic Scanner
+(Steffen Gerlach, 2012) and WinDirStat/WizTree, but rebuilt as a native Rust app.
 
 ![Disk Scanner](docs/screenshot.png)
+
+| Rings | Treemap | Heatmap |
+| --- | --- | --- |
+| ![Sunburst](docs/screenshot.png) | ![Treemap](docs/treemap.png) | ![Heatmap](docs/heatmap.png) |
 
 ## What it does
 
 - **Scans a volume or folder in parallel** with a `rayon`-backed walker; one pass, no
   index file, cancellable at any time.
-- **Renders a multilevel sunburst** on the GPU through GPUI (Zed's UI framework): the hub
-  shows the current folder, each ring is one directory level deeper. Click a slice to zoom
-  in; hover to trace a slice's ancestry; the hub, labels and the breakdown panel follow.
-- **Weights rings by size or by file count** — the same tree, re-proportioned.
+- **Three views of the same tree** (`1` / `2` / `3`, or the buttons in the top bar):
+  - **Rings** — the multilevel sunburst: the hub is the current folder, each ring one
+    directory level deeper. Click a slice to zoom in; hover to trace its ancestry.
+  - **Treemap** — the WinDirStat/WizTree layout, squarified so cells stay close to square,
+    with a cushion gradient that makes nested folders readable at a glance.
+  - **Heatmap** — every item gets an equal cell and the colour carries the size on a
+    logarithmic scale, which is what makes "a thousand small files add up to more than the
+    one big folder" visible; sorted-list and treemap layouts hide exactly that pattern.
+- **Weights cells and rings by size or by file count** — the same tree, re-proportioned.
 - **Breakdown panel** lists the biggest direct children of the focused folder, with a
   visual share meter, and syncs hover highlighting with the chart.
 - **Clickable path** in the focus card: every folder name in `C:\Users\…\Xamarin` is a
   breadcrumb segment, so one click re-centres the chart on that folder (and on a folder
   outside the current scan it simply starts scanning it).
-- **Right-click actions** on a slice or a breakdown row: *Reveal in Explorer*, and
-  *Delete folder* / *Delete file* (moves it to the Recycle Bin after a confirmation).
+- **Right-click actions** on a slice, a treemap cell or a breakdown row: *Reveal in
+  Explorer*, and *Delete folder* / *Delete file* (moves it to the Recycle Bin after a
+  confirmation).
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
 - **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or
   `F5` / `Ctrl+R`) re-walks just that subtree, marks the buttons, and pushes the size
   difference back through the ancestors instead of re-reading the whole volume.
-- **Volume switching never blocks**: a volume already walked in this session is painted from
-  memory the instant you click its chip, while the fresh scan runs behind the chart with a
-  progress pill — the window never blanks out or forgets where you were.
+- **Volume switching never rescans or blanks out**: a volume already walked in this session
+  is painted from memory the instant you click its chip; only a volume you have never
+  scanned starts a walk. Refreshing is always explicit (`F5` / `Ctrl+R` / *Rescan*).
 - **Auto / Dark / Light theme**: the `◐` toggle follows the Windows app theme by default and
   remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
-- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `F5` / `Ctrl+R` rescan the open folder,
-  `Esc` closes the menu, dialog or tooltip (or stops a running scan).
+- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `1` / `2` / `3` switch views,
+  `F5` / `Ctrl+R` rescan the open folder, `Esc` closes the menu, dialog or tooltip
+  (or stops a running scan).
 
 No webview: the window, the chart and the panels are drawn by GPUI directly.
 
@@ -42,7 +54,8 @@ No webview: the window, the chart and the panels are drawn by GPUI directly.
 | --- | --- |
 | UI | [GPUI](https://crates.io/crates/gpui) 0.2 — native Rust rendering, no HTML/CSS |
 | Scanner | Rust — `windows-sys` for volume info and the shell, `rayon` for the parallel walk |
-| Chart | hand-rolled arc geometry (`PathBuilder` → `Window::paint_path`), no plotting crate |
+| Chart | hand-rolled arc, squarified-treemap and heatmap geometry (`PathBuilder` →
+  `Window::paint_path`, `Window::paint_quad`), no plotting crate |
 
 ## Layout
 
@@ -51,11 +64,11 @@ apps/desktop-gpui/
   src/main.rs    entry point: opens the 1320x880 window
   src/app.rs     the view: top bar, chart area, breakdown panel, status bar, overlays,
                  scan job plumbing, zoom state, context menu + delete flow
-  src/model.rs   tree model, chart layout (rings/slices), hit testing, geometry
-  src/theme.rs   colours, palette, number formatting
-  src/sys.rs     Explorer reveal + Recycle Bin (SHFileOperationW)
+  src/model.rs   tree model, ring/slice/tile layout, hit testing, geometry
+  src/theme.rs   light + dark palettes, sunburst palette, heatmap ramp, formatters
+  src/sys.rs     Explorer reveal + Recycle Bin (SHFileOperationW), Windows theme probe
 crates/disk-scan/
-  src/scanner.rs parallel directory walk, hit counters, tree compaction
+  src/scanner.rs parallel directory walk, on-disk accounting, tree compaction
   src/drives.rs  Win32 volume enumeration (GetLogicalDrives, GetDiskFreeSpaceExW, …)
 scripts/
   rust-env.ps1   runs cargo inside a working Visual Studio developer environment
@@ -74,7 +87,28 @@ the tree is compacted so a 2-million-file volume still renders smoothly:
 - the total node count is capped (`NODE_BUDGET`) and depth is bounded.
 
 The UI never walks a raw directory tree — it only lays out what the scanner decided is
-worth showing, and caps itself at `MAX_RINGS` rings and `MAX_SLICES` arcs per view.
+worth showing, and caps itself at `MAX_RINGS` rings and `MAX_SLICES` arcs per view. The node
+budget is split fairly between siblings, so one huge first child cannot starve the rest of the
+volume into a single "(N more)" block.
+
+### How the numbers are accounted
+
+The scan reports what the volume actually holds, not the sum of the sizes Explorer would show
+in a *list*:
+
+- **On-disk size, not logical size** — sparse, NTFS-compressed and cloud placeholder files are
+  re-measured with `GetCompressedFileSizeW`, so a 40 GB sparse VHD that occupies 3 GB is
+  counted as 3 GB, and an undownloaded OneDrive file counts as the little it stores locally.
+  The extra call is only made for files carrying those attributes.
+- **Hard links counted once** — a file with more than one name is identified by
+  `(volume serial, file index)` through one handle and only the first name contributes bytes.
+  To keep that off the hot path only files of 8 MiB or more are checked (`DEDUPE_FLOOR`),
+  which is where a duplicate link actually distorts a chart.
+- **Reparse points** (junctions, mount points, dedup stubs) are skipped entirely, so
+  `Users\All Users -> ProgramData` and cloud-sync links cannot be counted twice.
+
+Measured on `C:\` here: 3.3 M files · 532 K folders, and the top-level numbers now match what
+Explorer's *Size on disk* adds up to instead of the larger logical total.
 
 ## Building
 

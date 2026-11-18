@@ -219,6 +219,20 @@ pub fn rest_color(depth: usize) -> Hsla {
     }
 }
 
+/// Heatmap colour for a log-scaled rank in `0.0..=1.0`: cold blue for the
+/// smallest cells, through teal and green, to red for the biggest. Equal-sized
+/// cells plus this ramp is what makes "a thousand small files" readable.
+pub fn heat_color(rank: f32) -> Hsla {
+    let rank = rank.clamp(0.0, 1.0);
+    let hue = 205.0 * (1.0 - rank);
+    let (sat, light) = if is_light() {
+        (0.66, 0.44 + rank * 0.08)
+    } else {
+        (0.58, 0.34 + rank * 0.24)
+    };
+    hsla(hue / 360.0, sat, light, 1.0)
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut value = bytes as f64;

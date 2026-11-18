@@ -15,6 +15,8 @@ pub const MAX_RINGS: usize = 5;
 pub const MIN_SPAN: f32 = 0.0016;
 /// Hard cap on slices per frame, so a pathological folder cannot stall paint.
 pub const MAX_SLICES: usize = 1800;
+/// Height of the name strip a folder keeps at the top of its treemap cell.
+pub const TREEMAP_HEADER: f32 = 13.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Metric {
@@ -115,12 +117,75 @@ impl Slice {
     }
 }
 
+/// Which drawing algorithm the chart area uses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum View {
+    Rings,
+    Treemap,
+    Heatmap,
+}
+
+impl View {
+    pub fn label(self) -> &'static str {
+        match self {
+            View::Rings => "Rings",
+            View::Treemap => "Treemap",
+            View::Heatmap => "Heatmap",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            View::Rings => "rings",
+            View::Treemap => "treemap",
+            View::Heatmap => "heatmap",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<View> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rings" | "sunburst" => Some(View::Rings),
+            "treemap" | "tree" => Some(View::Treemap),
+            "heatmap" | "heat" => Some(View::Heatmap),
+            _ => None,
+        }
+    }
+}
+
+/// A rectangle in chart-local logical pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Tile {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Tile {
+    pub fn area(&self) -> f32 {
+        self.w * self.h
+    }
+
+    pub fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
+    }
+
+    fn inset(&self, by: f32) -> Tile {
+        Tile {
+            x: self.x + by,
+            y: self.y + by,
+            w: (self.w - by * 2.0).max(0.0),
+            h: (self.h - by * 2.0).max(0.0),
+        }
+    }
+}
+
+/// Weight of the focused folder, i.e. 100% of the ring.
 pub struct ChartModel {
     pub focus: Arc<Node>,
     pub metric: Metric,
     pub slices: Vec<Slice>,
     pub rings: usize,
-    /// Weight of the focused folder, i.e. 100% of the ring.
     pub total: f64,
 }
 
@@ -305,3 +370,221 @@ pub fn short_name(name: &str, max: usize) -> String {
     out.push('…');
     out
 }
+
+/// One rectangle per chart slice (same indices), laid out as a nested,
+/// squarified treemap: each folder's children fill the folder's own rectangle.
+/// Deeper levels get a 1 px inset so borders stay visible.
+pub fn treemap(model: &ChartModel, width: f32, height: f32) -> Vec<Tile> {
+    let mut tiles = vec![Tile::default(); model.slices.len()];
+    if width <= 1.0 || height <= 1.0 || model.slices.is_empty() {
+        return tiles;
+    }
+
+    // children[parent + 1] = slice indices under that parent (0 = the focus).
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); model.slices.len() + 1];
+    for (index, slice) in model.slices.iter().enumerate() {
+        let slot = if slice.parent == usize::MAX {
+            0
+        } else {
+            slice.parent + 1
+        };
+        children[slot].push(index);
+    }
+
+    let root = Tile {
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+    };
+
+    // Iterative depth-first so a pathological tree cannot blow the stack.
+    let mut stack: Vec<(Tile, usize)> = vec![(root, 0)];
+    while let Some((rect, parent)) = stack.pop() {
+        let kids = &children[parent];
+        if kids.is_empty() {
+            continue;
+        }
+        let mut weights: Vec<f32> = kids.iter().map(|&i| model.slices[i].span()).collect();
+        // Squarify wants the biggest items first.
+        let mut order: Vec<usize> = (0..kids.len()).collect();
+        order.sort_by(|&a, &b| weights[b].total_cmp(&weights[a]));
+        let sorted: Vec<f32> = order.iter().map(|&i| weights[i]).collect();
+        weights = sorted;
+
+        let mut placed = vec![Tile::default(); kids.len()];
+        squarify(&weights, rect, &mut placed);
+        for (slot, &kid) in order.iter().enumerate() {
+            tiles[kids[kid]] = placed[slot];
+        }
+
+        // Recurse into folders that have a rectangle worth subdividing. The
+        // top strip of the folder's own rectangle is kept for its name, so
+        // nested labels never land on top of each other.
+        for &kid in kids.iter() {
+            let tile = tiles[kid];
+            if !children[kid + 1].is_empty() && tile.w > 40.0 && tile.h > 40.0 {
+                let inner = if tile.h > TREEMAP_HEADER + 22.0 {
+                    Tile {
+                        x: tile.x + 1.0,
+                        y: tile.y + TREEMAP_HEADER,
+                        w: (tile.w - 2.0).max(0.0),
+                        h: (tile.h - TREEMAP_HEADER - 1.0).max(0.0),
+                    }
+                } else {
+                    tile.inset(1.0)
+                };
+                stack.push((inner, kid + 1));
+            }
+        }
+    }
+
+    tiles
+}
+
+/// Squarified treemap placement of `weights` (descending) inside `rect`.
+fn squarify(weights: &[f32], rect: Tile, out: &mut [Tile]) {
+    let total: f32 = weights.iter().sum();
+    if total <= 0.0 {
+        return;
+    }
+    let scale = rect.area() / total;
+    let areas: Vec<f32> = weights.iter().map(|w| (w * scale).max(0.0)).collect();
+
+    let mut x = rect.x;
+    let mut y = rect.y;
+    let mut w = rect.w;
+    let mut h = rect.h;
+    let mut cursor = 0;
+
+    while cursor < areas.len() {
+        let side = w.min(h);
+        if side < 0.5 || w <= 0.0 || h <= 0.0 {
+            break;
+        }
+
+        // Grow the row while that keeps the worst aspect ratio improving.
+        let mut end = cursor;
+        let mut row_sum = 0.0f32;
+        let mut row_min = f32::MAX;
+        let mut row_max = 0.0f32;
+        let mut worst = f32::MAX;
+        while end < areas.len() {
+            let next_sum = row_sum + areas[end];
+            let next_min = row_min.min(areas[end]);
+            let next_max = row_max.max(areas[end]);
+            let ratio = worst_ratio(next_sum, next_min, next_max, side);
+            if ratio > worst {
+                break;
+            }
+            row_sum = next_sum;
+            row_min = next_min;
+            row_max = next_max;
+            worst = ratio;
+            end += 1;
+        }
+        if end == cursor {
+            row_sum = areas[cursor];
+            end = cursor + 1;
+        }
+
+        let thickness = (row_sum / side).min(if w >= h { w } else { h });
+        let mut offset = 0.0;
+        for index in cursor..end {
+            let length = if row_sum > 0.0 {
+                areas[index] / row_sum * side
+            } else {
+                0.0
+            };
+            out[index] = if w >= h {
+                Tile {
+                    x,
+                    y: y + offset,
+                    w: thickness,
+                    h: length,
+                }
+            } else {
+                Tile {
+                    x: x + offset,
+                    y,
+                    w: length,
+                    h: thickness,
+                }
+            };
+            offset += length;
+        }
+
+        if w >= h {
+            x += thickness;
+            w -= thickness;
+        } else {
+            y += thickness;
+            h -= thickness;
+        }
+        cursor = end;
+    }
+}
+
+fn worst_ratio(sum: f32, min: f32, max: f32, side: f32) -> f32 {
+    if sum <= 0.0 || min <= 0.0 {
+        return f32::MAX;
+    }
+    let side2 = side * side;
+    let sum2 = sum * sum;
+    (side2 * max / sum2).max(sum2 / (side2 * min))
+}
+
+/// Equal-sized cells for every visible item, in weight order. The caller turns
+/// each item's weight into a colour on a log scale, which is what makes a pile
+/// of tiny files visible instead of a thin sliver.
+pub fn heatmap(model: &ChartModel, width: f32, height: f32) -> Vec<Tile> {
+    let count = model.slices.len();
+    let mut tiles = vec![Tile::default(); count];
+    if count == 0 || width <= 1.0 || height <= 1.0 {
+        return tiles;
+    }
+
+    let aspect = (width / height).max(0.2);
+    let cols = ((count as f32 * aspect).sqrt().ceil() as usize).clamp(1, count);
+    let rows = count.div_ceil(cols);
+    let cell_w = width / cols as f32;
+    let cell_h = height / rows as f32;
+
+    // Biggest first, so the hot cells sit at the top left where the eye lands.
+    let mut order: Vec<usize> = (0..count).collect();
+    order.sort_by(|&a, &b| {
+        model.slices[b]
+            .span()
+            .total_cmp(&model.slices[a].span())
+            .then_with(|| model.slices[a].depth.cmp(&model.slices[b].depth))
+    });
+
+    for (slot, &index) in order.iter().enumerate() {
+        let row = slot / cols;
+        let col = slot % cols;
+        // A hair of gutter so neighbouring cells stay distinguishable.
+        let gap = if cell_w.min(cell_h) > 8.0 { 1.0 } else { 0.0 };
+        tiles[index] = Tile {
+            x: col as f32 * cell_w + gap * 0.5,
+            y: row as f32 * cell_h + gap * 0.5,
+            w: (cell_w - gap).max(1.0),
+            h: (cell_h - gap).max(1.0),
+        };
+    }
+
+    tiles
+}
+
+/// Log-scaled position of a weight inside `[min, max]`, in `0.0..=1.0`.
+pub fn log_rank(weight: f64, min: f64, max: f64) -> f32 {
+    if weight <= 0.0 {
+        return 0.0;
+    }
+    let lo = (min.max(1.0)).ln();
+    let hi = max.max(min).max(1.0).ln();
+    if hi <= lo {
+        return 0.5;
+    }
+    (((weight.ln() - lo) / (hi - lo)) as f32).clamp(0.0, 1.0)
+}
+
