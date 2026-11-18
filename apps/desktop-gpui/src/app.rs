@@ -57,10 +57,6 @@ struct Menu {
     node: Arc<Node>,
 }
 
-struct Confirm {
-    node: Arc<Node>,
-}
-
 struct Placed {
     origin: Point<Pixels>,
     geom: Geom,
@@ -92,7 +88,6 @@ pub struct DiskApp {
     hover: Option<usize>,
     tooltip: Option<Tooltip>,
     menu: Option<Menu>,
-    confirm: Option<Confirm>,
     placed: Arc<Mutex<Placed>>,
     last_root: String,
     note: Option<String>,
@@ -141,7 +136,6 @@ impl DiskApp {
             hover: None,
             tooltip: None,
             menu: None,
-            confirm: None,
             placed,
             last_root: last_root.clone(),
             note: None,
@@ -288,7 +282,6 @@ impl DiskApp {
                 self.hover = None;
                 self.tooltip = None;
                 self.menu = None;
-                self.confirm = None;
                 self.note = Some(format!(
                     "Showing the scan from {} ago — Rescan to refresh",
                     theme::format_seconds(cached.at.elapsed().as_secs_f64())
@@ -305,6 +298,7 @@ impl DiskApp {
             return;
         }
         self.view = view;
+        save_view(view);
         self.hover = None;
         self.tooltip = None;
         cx.notify();
@@ -381,7 +375,6 @@ impl DiskApp {
         self.hover = None;
         self.tooltip = None;
         self.menu = None;
-        self.confirm = None;
         self.note = None;
 
         if subtree {
@@ -575,27 +568,55 @@ impl DiskApp {
         if node.kind == Kind::Other || node.path.is_empty() {
             return;
         }
-        self.confirm = Some(Confirm { node });
         self.menu = None;
-        cx.notify();
-    }
 
-    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
-        let Some(confirm) = self.confirm.take() else {
-            return;
+        let detail = if node.is_dir() {
+            let files = if node.files == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{} files", theme::format_count(node.files))
+            };
+            format!("{} · {}", theme::format_bytes(node.size), files)
+        } else {
+            theme::format_bytes(node.size)
         };
-        let node = confirm.node;
+        let title = if node.is_dir() {
+            "Delete folder"
+        } else {
+            "Delete file"
+        };
+        let text = format!(
+            "Move this to the Recycle Bin?\n\n{}\n{}\n\nYou can restore it from the Recycle Bin.",
+            node.path, detail
+        );
+        let owner = crate::sys::active_window();
         let path = node.path.clone();
+
+        // The message box is modal to this window and runs on a worker thread so
+        // the chart keeps painting behind it.
         cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_spawn(async move { crate::sys::recycle(&path) })
+            let confirmed = cx
+                .background_spawn(async move { crate::sys::confirm(owner, title, &text) })
                 .await;
-            this.update(cx, |this, cx| match outcome {
-                Ok(()) => {
-                    this.remove_subtree(&node.path, cx);
-                    this.note = Some(format!("Moved {} to the Recycle Bin", node.name));
+            if !confirmed {
+                return;
+            }
+            let target = path.clone();
+            let outcome = cx
+                .background_spawn(async move { crate::sys::recycle(&target) })
+                .await;
+            this.update(cx, |this, cx| {
+                match outcome {
+                    Ok(()) => {
+                        this.remove_subtree(&path, cx);
+                        this.note = Some(format!(
+                            "Moved {} to the Recycle Bin",
+                            short_name(&path, 44)
+                        ));
+                    }
+                    Err(error) => this.note = Some(error),
                 }
-                Err(error) => this.note = Some(error),
+                cx.notify();
             })
             .ok();
         })
@@ -1439,9 +1460,7 @@ impl DiskApp {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.confirm.is_some() {
-                    self.confirm = None;
-                } else if self.menu.is_some() {
+                if self.menu.is_some() {
                     self.menu = None;
                 } else if matches!(self.phase, Phase::Scanning) {
                     self.cancel_scan(cx);
@@ -1889,97 +1908,6 @@ impl DiskApp {
                     .child(menu_item(delete_label, true, has_path, cx, move |this, cx| {
                         this.ask_delete(delete_node.clone(), cx);
                     }))
-                    .into_any_element(),
-            );
-        }
-
-        if let Some(confirm) = &self.confirm {
-            let node = confirm.node.clone();
-            let detail = if node.is_dir() {
-                format!(
-                    "{} · {} files",
-                    theme::format_bytes(node.size),
-                    theme::format_count(node.files)
-                )
-            } else {
-                theme::format_bytes(node.size)
-            };
-            layers.push(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .w_full()
-                    .h_full()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(theme::scrim())
-                    .child(
-                        div()
-                            .w(px(420.0))
-                            .p(px(18.0))
-                            .rounded(px(14.0))
-                            .bg(theme::surface())
-                            .border_1()
-                            .border_color(theme::hairline())
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(15.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Move to Recycle Bin?"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(theme::text())
-                                    .child(node.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme::text_faint())
-                                    .truncate()
-                                    .child(node.path.clone()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .text_color(theme::text_dim())
-                                    .child(detail),
-                            )
-                            .child(
-                                div()
-                                    .mt(px(6.0))
-                                    .flex()
-                                    .justify_end()
-                                    .gap(px(8.0))
-                                    .child(self.action_button("Cancel", cx, |this, cx| {
-                                        this.confirm = None;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .id("confirm-delete")
-                                            .px(px(12.0))
-                                            .py(px(5.0))
-                                            .rounded(px(7.0))
-                                            .bg(theme::danger())
-                                            .text_size(px(11.5))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(gpui::rgb(0x1a0b0b))
-                                            .cursor_pointer()
-                                            .hover(|style| style.opacity(0.88))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.confirm_delete(cx);
-                                            }))
-                                            .child("Delete"),
-                                    ),
-                            ),
-                    )
                     .into_any_element(),
             );
         }
@@ -2508,6 +2436,17 @@ pub fn open(cx: &mut App) {
     )
     .expect("could not open the window");
     cx.activate(true);
+
+    // The window exists by now, but give the compositor a moment before asking
+    // for its handle, and try once more in case the first pass ran too early.
+    crate::sys::apply_window_icon();
+    cx.spawn(async move |cx| {
+        cx.background_executor()
+            .timer(std::time::Duration::from_millis(400))
+            .await;
+        crate::sys::apply_window_icon();
+    })
+    .detach();
 }
 
 #[allow(dead_code)]

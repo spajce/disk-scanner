@@ -13,5 +13,15 @@ gpui = "0.2"
 disk-scan = { path = "../../crates/disk-scan" }
 rayon = "1.10"
 
+[build-dependencies]
+embed-resource = "3"
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_System_Registry"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }

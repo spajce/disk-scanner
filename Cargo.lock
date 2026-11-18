@@ -1282,6 +1282,7 @@ name = "desktop-gpui"
 version = "0.1.0"
 dependencies = [
  "disk-scan",
+ "embed-resource",
  "gpui",
  "rayon",
  "windows-sys 0.59.0",

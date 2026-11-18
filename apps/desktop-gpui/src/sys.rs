@@ -52,6 +52,111 @@ pub fn reveal(path: &str) {
     }
 }
 
+/// Handle of the window that owns the current keyboard focus, used as the owner
+/// of the confirmation box so it stays attached to this app.
+pub fn active_window() -> isize {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+
+    unsafe { GetActiveWindow() as isize }
+}
+
+static ICON_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+unsafe extern "system" fn find_own_window(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    _param: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindowVisible};
+
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, &mut pid);
+    if pid == std::process::id() && IsWindowVisible(hwnd) != 0 {
+        ICON_TARGET.store(hwnd as isize, std::sync::atomic::Ordering::SeqCst);
+        return 0;
+    }
+    1
+}
+
+/// Give the top-level window the sunburst icon embedded by `build.rs`.
+///
+/// GPUI never sets `WM_SETICON`, so without this the taskbar and alt-tab fall
+/// back to the generic application icon.
+pub fn apply_window_icon() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+        LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
+    };
+
+    // SAFETY: the callback only touches a static atomic and the Win32 handles
+    // are checked for null before use; resource id 1 is the icon in `app.rc`.
+    unsafe {
+        ICON_TARGET.store(0, std::sync::atomic::Ordering::SeqCst);
+        EnumWindows(Some(find_own_window), 0);
+        let hwnd = ICON_TARGET.load(std::sync::atomic::Ordering::SeqCst);
+        if hwnd == 0 {
+            return;
+        }
+        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let module = GetModuleHandleW(std::ptr::null());
+        let id = 1 as *const u16;
+
+        let big = LoadImageW(
+            module,
+            id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXICON),
+            GetSystemMetrics(SM_CYICON),
+            LR_DEFAULTCOLOR,
+        );
+        let small = LoadImageW(
+            module,
+            id,
+            IMAGE_ICON,
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON),
+            LR_DEFAULTCOLOR,
+        );
+        if !big.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, big as isize);
+        }
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+        }
+    }
+}
+
+/// Ask a yes/no question in a native Windows message box.
+///
+/// Runs on a background thread so the UI keeps painting while it is open; the
+/// default button is **No**, and closing the box answers No.
+pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, IDYES,
+    };
+
+    let to_wide = |value: &str| -> Vec<u16> {
+        value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let text = to_wide(text);
+    let title = to_wide(title);
+
+    // SAFETY: both strings are NUL-terminated UTF-16 and outlive the call; the
+    // owner handle is a plain window handle owned by this process.
+    let answer = unsafe {
+        MessageBoxW(
+            owner as *mut core::ffi::c_void,
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+        )
+    };
+    answer == IDYES
+}
+
 /// Move `path` to the Recycle Bin. Returns a human readable error on failure.
 pub fn recycle(path: &str) -> Result<(), String> {
     let target = std::path::Path::new(path);

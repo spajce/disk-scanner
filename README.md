@@ -31,8 +31,8 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
   breadcrumb segment, so one click re-centres the chart on that folder (and on a folder
   outside the current scan it simply starts scanning it).
 - **Right-click actions** on a slice, a treemap cell or a breakdown row: *Reveal in
-  Explorer*, and *Delete folder* / *Delete file* (moves it to the Recycle Bin after a
-  confirmation).
+  Explorer*, and *Delete folder* / *Delete file*, which asks first with the native Windows
+  confirmation dialog (No is the default answer) and then moves the item to the Recycle Bin.
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
 - **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or
@@ -62,6 +62,8 @@ No webview: the window, the chart and the panels are drawn by GPUI directly.
 
 ```
 apps/desktop-gpui/
+  build.rs       embeds assets/icon.ico as the executable + window icon
+  assets/        icon.ico / icon.png (drawn by scripts/make-icon.py), app.rc
   src/main.rs    entry point: opens the 1320x880 window
   src/app.rs     the view: top bar, chart area, breakdown panel, status bar, overlays,
                  scan job plumbing, zoom state, context menu + delete flow
@@ -73,6 +75,7 @@ crates/disk-scan/
   src/drives.rs  Win32 volume enumeration (GetLogicalDrives, GetDiskFreeSpaceExW, …)
 scripts/
   rust-env.ps1   runs cargo inside a working Visual Studio developer environment
+  make-icon.py   regenerates the sunburst icon at every Windows icon size
 ```
 
 ### How the tree is made
@@ -80,17 +83,20 @@ scripts/
 The scanner accumulates sizes bottom-up in one parallel pass. Before it reaches the UI,
 the tree is compacted so a 2-million-file volume still renders smoothly:
 
-- children sorted by size; the long tail is folded into one `(N more)` slice
-  (`REL_FLOOR`, `ABS_FLOOR` thresholds);
-- loose files below `FILE_FLOOR` (and the small tail of a directory) become one
-  `smaller files` slice, so a folder's arcs always add up to the number in the hub;
+- children sorted by size; anything too small to draw on its own (`REL_FLOOR` /
+  `ABS_FLOOR`) is *folded into the folder itself*, so no unnamed "(N more)" block ever
+  hides the real folder names — only a folder with thousands of children (`WinSxS` and its
+  like) still gets a single grey "smaller items" slice, because there is nothing better to
+  draw with 15 000 cells;
+- loose files below `FILE_FLOOR` are folded the same way;
 - single-child chains are collapsed into `a/b/c` slices;
 - the total node count is capped (`NODE_BUDGET`) and depth is bounded.
 
 The UI never walks a raw directory tree — it only lays out what the scanner decided is
 worth showing, and caps itself at `MAX_RINGS` rings and `MAX_SLICES` arcs per view. The node
-budget is split fairly between siblings, so one huge first child cannot starve the rest of the
-volume into a single "(N more)" block.
+budget is split between siblings *in proportion to their size*, so the detail follows the bytes
+and a deep branch like `AppData\Local` keeps its own children instead of collapsing into one
+bucket.
 
 ### How the numbers are accounted
 

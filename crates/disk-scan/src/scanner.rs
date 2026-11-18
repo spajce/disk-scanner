@@ -32,19 +32,22 @@ const DEDUPE_FLOOR: u64 = 8 * 1024 * 1024;
 /// How deep the compacted payload may go.
 const MAX_DEPTH: usize = 16;
 /// Hard cap of kept children per node; the rest is aggregated.
-const MAX_CHILDREN: usize = 64;
+const MAX_CHILDREN: usize = 512;
 /// Always keep this many of the biggest children, however small they are.
 const MIN_TOP: usize = 10;
 /// Absolute floor: fraction of the scanned total a slice needs to be kept.
-const ABS_FLOOR: f64 = 0.000_08;
+const ABS_FLOOR: f64 = 0.000_002;
 /// Relative floor: fraction of its parent a slice needs to be kept.
-const REL_FLOOR: f64 = 0.001;
+const REL_FLOOR: f64 = 0.000_02;
 /// Global budget for kept nodes in the payload.
-const NODE_BUDGET: usize = 160_000;
+const NODE_BUDGET: usize = 600_000;
+/// Leftover this small (fraction of the folder) is folded into the folder
+/// itself instead of becoming an unnamed "(n smaller items)" slice.
+const REST_FLOOR: f64 = 0.03;
 /// Files smaller than this are never drawn as their own arc.
 const FILE_FLOOR: u64 = 64 * 1024;
 /// At most this many file arcs per directory (the biggest ones).
-const MAX_FILE_SLICES: usize = 8;
+const MAX_FILE_SLICES: usize = 32;
 
 /// Live counters shared between the walker threads and the progress emitter.
 pub struct ScanCounters {
@@ -466,24 +469,39 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     let rel_floor = ((current.size as f64) * REL_FLOOR) as u64;
 
     let mut kept: Vec<NodeDto> = Vec::new();
-    // The node budget is shared out between the remaining siblings instead of
-    // being spent depth-first: otherwise the first big child (almost always
-    // `Users`) eats the whole budget and its later siblings collapse into one
-    // huge "(n more)" bucket that hides most of the volume.
+    // The node budget is shared out by *size* rather than evenly, and it is
+    // re-shared after every child: an even split starves deep branches (each
+    // level divides again, so `AppData\Local` ended up with a dozen nodes and
+    // folded everything else into one "(n smaller items)" block), while letting
+    // a subtree take a share proportional to its bytes keeps the detail where
+    // the space actually is.
     let mut remaining = *budget;
+    let mut left_weight: u64 = kids
+        .iter()
+        .enumerate()
+        .filter(|(index, child)| {
+            depth < MAX_DEPTH
+                && (*index < MIN_TOP || child.size >= abs_floor.max(rel_floor))
+        })
+        .map(|(_, child)| child.size.max(1))
+        .sum();
 
     for (index, child) in kids.iter().enumerate() {
         let wanted = depth < MAX_DEPTH
             && remaining > 0
             && kept.len() < MAX_CHILDREN
             && (index < MIN_TOP || child.size >= abs_floor.max(rel_floor));
-        if wanted {
-            let left = kids.len().saturating_sub(index).max(1);
-            let mut share = (remaining / left).max(1);
-            let granted = share;
-            kept.push(convert(child, total, depth + 1, &mut share));
-            remaining = remaining.saturating_sub(granted.saturating_sub(share));
+        if !wanted {
+            continue;
         }
+
+        let weight = child.size.max(1);
+        let share_of_pool = weight as f64 / left_weight.max(1) as f64;
+        let mut share = ((remaining as f64 * share_of_pool) as usize).max(1);
+        let granted = share;
+        kept.push(convert(child, total, depth + 1, &mut share));
+        remaining = remaining.saturating_sub(granted.saturating_sub(share));
+        left_weight = left_weight.saturating_sub(weight);
     }
 
     *budget = remaining.saturating_sub(1);
@@ -491,26 +509,38 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     // Everything without an arc of its own — children below the floors, children
     // over MAX_CHILDREN, and loose files under FILE_FLOOR — still has to be
     // visible, otherwise the arcs would not add up to the folder in the middle.
+    // When that leftover is a rounding detail we fold it into the folder itself
+    // instead of drawing an unnamed "(n more)" block that hides real names.
     let kept_size: u64 = kept.iter().map(|child| child.size).sum();
     let kept_files: u64 = kept.iter().map(|child| child.files).sum();
     let kept_dirs: u64 = kept.iter().map(|child| child.dirs).sum();
     let rest_size = current.size.saturating_sub(kept_size);
 
+    // File and folder counts always stay exact — only the byte total of a
+    // folder is allowed to shrink to the arcs that are actually drawn, so the
+    // panel never claims fewer files than the volume has.
+    let mut shown_size = current.size;
+
     if rest_size > 0 {
-        let rest_children = current.children.len().saturating_sub(kept.len());
-        kept.push(NodeDto {
-            name: if rest_children > 0 {
-                format!("{} more", rest_children)
-            } else {
-                "smaller files".to_string()
-            },
-            path: String::new(),
-            size: rest_size,
-            files: current.files.saturating_sub(kept_files),
-            dirs: current.dirs.saturating_sub(kept_dirs),
-            kind: "other",
-            children: Vec::new(),
-        });
+        let share = rest_size as f64 / current.size.max(1) as f64;
+        if share <= REST_FLOOR && kept_size > 0 {
+            shown_size = kept_size;
+        } else {
+            let rest_children = current.children.len().saturating_sub(kept.len());
+            kept.push(NodeDto {
+                name: if rest_children > 0 {
+                    format!("{} smaller items", rest_children)
+                } else {
+                    "smaller files".to_string()
+                },
+                path: String::new(),
+                size: rest_size,
+                files: current.files.saturating_sub(kept_files),
+                dirs: current.dirs.saturating_sub(kept_dirs),
+                kind: "other",
+                children: Vec::new(),
+            });
+        }
     }
 
     kept.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
@@ -518,7 +548,7 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     NodeDto {
         name,
         path: current.path.clone(),
-        size: current.size,
+        size: shown_size,
         files: current.files,
         dirs: current.dirs,
         kind: "dir",
@@ -625,7 +655,7 @@ mod tests {
 
         let dto = to_dto(&raw, raw.size);
         let sum: u64 = dto.children.iter().map(|child| child.size).sum();
-        assert_eq!(sum, raw.size, "arcs must add up to the folder total");
+        assert_eq!(sum, dto.size, "arcs must add up to the folder total");
     }
 
     #[test]
@@ -653,27 +683,55 @@ mod tests {
     }
 
     #[test]
-    fn dto_sorts_children_and_aggregates_the_tail() {
+    fn dto_sorts_children_and_folds_a_tiny_remainder() {
         let tree = TempTree::new("agg");
         tree.file("big/one.bin", 100_000);
         tree.file("mid/two.bin", 50_000);
-        // Forty tiny folders: they must not each become an arc.
+        // Forty tiny folders: keeping every one of them is fine, they are just
+        // slivers — an unnamed "(n smaller items)" block would hide real names.
         for index in 0..40 {
             tree.file(&format!("tiny{index}/x.bin"), 16);
+        }
+
+        let raw = scan_tree(&tree.0);
+        let dto = to_dto(&raw, raw.size);
+
+        assert_eq!(dto.kind, "dir");
+        let sizes: Vec<u64> = dto.children.iter().map(|child| child.size).collect();
+        let mut sorted = sizes.clone();
+        sorted.sort_by(|a, b| b.cmp(a));
+        assert_eq!(sizes, sorted, "children must be sorted by size");
+        assert!(
+            !dto.children.iter().any(|child| child.kind == "other"),
+            "a rounding remainder is folded into the folder, not drawn"
+        );
+        let kept_total: u64 = dto.children.iter().map(|child| child.size).sum();
+        assert_eq!(kept_total, dto.size, "arcs must add up to the folder total");
+    }
+
+    #[test]
+    fn dto_aggregates_only_a_large_remainder() {
+        let tree = TempTree::new("big-agg");
+        // More folders than MAX_CHILDREN can hold: the leftover is far too big
+        // to fold into the parent silently, so it has to become a slice.
+        for index in 0..(MAX_CHILDREN + 180) {
+            tree.file(&format!("item{index:03}/x.bin"), 4096);
         }
 
         let raw = scan_tree(&tree.0);
         let total = raw.size;
         let dto = to_dto(&raw, total);
 
-        assert_eq!(dto.kind, "dir");
-        assert_eq!(dto.size, total);
-        assert!(dto.children.len() < 40, "tail was not aggregated");
-        let sizes: Vec<u64> = dto.children.iter().map(|child| child.size).collect();
-        let mut sorted = sizes.clone();
-        sorted.sort_by(|a, b| b.cmp(a));
-        assert_eq!(sizes, sorted, "children must be sorted by size");
-        assert!(dto.children.iter().any(|child| child.kind == "other"));
+        assert!(
+            dto.children.len() <= MAX_CHILDREN + 1,
+            "the child cap must hold"
+        );
+        let rest = dto
+            .children
+            .iter()
+            .find(|child| child.kind == "other")
+            .expect("a large leftover still gets a slice");
+        assert!(rest.name.ends_with("smaller items"), "got {:?}", rest.name);
         let kept_total: u64 = dto.children.iter().map(|child| child.size).sum();
         assert_eq!(kept_total, total, "aggregation must not lose bytes");
     }
