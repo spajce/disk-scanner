@@ -540,23 +540,34 @@ fn worst_ratio(sum: f32, min: f32, max: f32, side: f32) -> f32 {
 pub fn heatmap(model: &ChartModel, width: f32, height: f32) -> Vec<Tile> {
     let count = model.slices.len();
     let mut tiles = vec![Tile::default(); count];
-    if count == 0 || width <= 1.0 || height <= 1.0 {
+    if count <= 1 || width <= 1.0 || height <= 1.0 {
         return tiles;
     }
 
+    // One level only: the heatmap is there to compare the items *inside* the
+    // open folder, so a leaf file and a whole subtree never share the grid.
+    // (There is no slice for the focus itself — its children carry `usize::MAX`
+    // as their parent.)
+    let mut order: Vec<usize> = (0..count)
+        .filter(|&index| model.slices[index].parent == usize::MAX)
+        .collect();
+    if order.is_empty() {
+        return tiles;
+    }
+
+    let slots = order.len();
     let aspect = (width / height).max(0.2);
-    let cols = ((count as f32 * aspect).sqrt().ceil() as usize).clamp(1, count);
-    let rows = count.div_ceil(cols);
+    let cols = ((slots as f32 * aspect).sqrt().ceil() as usize).clamp(1, slots);
+    let rows = slots.div_ceil(cols);
     let cell_w = width / cols as f32;
     let cell_h = height / rows as f32;
 
     // Biggest first, so the hot cells sit at the top left where the eye lands.
-    let mut order: Vec<usize> = (0..count).collect();
     order.sort_by(|&a, &b| {
         model.slices[b]
             .span()
             .total_cmp(&model.slices[a].span())
-            .then_with(|| model.slices[a].depth.cmp(&model.slices[b].depth))
+            .then_with(|| model.slices[a].node.name.cmp(&model.slices[b].node.name))
     });
 
     for (slot, &index) in order.iter().enumerate() {

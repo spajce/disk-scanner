@@ -20,9 +20,10 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
     directory level deeper. Click a slice to zoom in; hover to trace its ancestry.
   - **Treemap** — the WinDirStat/WizTree layout, squarified so cells stay close to square,
     with a cushion gradient that makes nested folders readable at a glance.
-  - **Heatmap** — every item gets an equal cell and the colour carries the size on a
-    logarithmic scale, which is what makes "a thousand small files add up to more than the
-    one big folder" visible; sorted-list and treemap layouts hide exactly that pattern.
+  - **Heatmap** — every item *in the open folder* gets an equal cell and the colour carries
+    the size on a logarithmic scale, which is what makes "a thousand small files add up to
+    more than the one big folder" visible; sorted-list and treemap layouts hide exactly that
+    pattern. Clicking a cell opens it, so the grid refills with its contents.
 - **Weights cells and rings by size or by file count** — the same tree, re-proportioned.
 - **Breakdown panel** lists the biggest direct children of the focused folder, with a
   visual share meter, and syncs hover highlighting with the chart.
