@@ -135,6 +135,10 @@ pub struct DiskApp {
     view: View,
     /// Canvas size the current tile labels were laid out for.
     tile_size: (f32, f32),
+    /// The volume picker: a select in the top bar with an in-flow list below it
+    /// (GPUI popups paint but never receive presses, so the options open as a
+    /// real row of the layout).
+    drives_open: bool,
 }
 
 impl DiskApp {
@@ -180,6 +184,7 @@ impl DiskApp {
             system_dark,
             view: initial_view(),
             tile_size: (-1.0, -1.0),
+            drives_open: false,
         };
 
         // Follow the OS while the skin is on "Auto": the registry value changes
@@ -330,10 +335,13 @@ impl DiskApp {
     /// Rings, treemap or heatmap over the same tree.
     fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         if self.view == view {
+            self.drives_open = false;
+            cx.notify();
             return;
         }
         self.view = view;
         save_view(view);
+        self.drives_open = false;
         self.hover = None;
         self.tooltip = None;
         cx.notify();
@@ -685,12 +693,6 @@ impl DiskApp {
     // ---------------------------------------------------------------- render
 
     fn top_bar(&self, cx: &mut Context<Self>) -> Div {
-        let mut chips: Vec<AnyElement> = Vec::new();
-        for (index, drive) in self.drives.iter().enumerate() {
-            let active = self.last_root.eq_ignore_ascii_case(&drive.root);
-            chips.push(self.drive_chip(index, drive, active, cx).into_any_element());
-        }
-
         div()
             .h(px(TOPBAR_H))
             .flex_shrink_0()
@@ -728,7 +730,7 @@ impl DiskApp {
                     ),
             )
             .child(div().flex_1())
-            .children(chips)
+            .child(self.drive_select(cx))
             .child(
                 div()
                     .flex()
@@ -784,50 +786,54 @@ impl DiskApp {
             .child(label)
     }
 
-    fn drive_chip(
-        &self,
-        index: usize,
-        drive: &DriveInfo,
-        active: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<Div> {
-        let used = drive.total.saturating_sub(drive.free);
-        let fraction = if drive.total == 0 {
-            0.0
-        } else {
-            used as f32 / drive.total as f32
+    /// The active volume, if it is still plugged in.
+    fn active_drive(&self) -> Option<&DriveInfo> {
+        self.drives
+            .iter()
+            .find(|drive| drive.root.eq_ignore_ascii_case(&self.last_root))
+    }
+
+    /// The select in the top bar: one line for the open volume, a chevron that
+    /// opens the list of volumes underneath it.
+    fn drive_select(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let active = self.active_drive();
+        let open = self.drives_open;
+        let title = match active {
+            Some(drive) => drive_title(drive),
+            None => "Choose volume".to_string(),
         };
-        let root = drive.root.clone();
-        let label = if drive.label.is_empty() {
-            drive.root.trim_end_matches('\\').to_string()
-        } else {
-            format!("{}  {}", drive.root.trim_end_matches('\\'), drive.label)
-        };
+        let usage = active
+            .map(|drive| {
+                format!(
+                    "{} free of {}",
+                    theme::format_bytes(drive.free),
+                    theme::format_bytes(drive.total)
+                )
+            })
+            .unwrap_or_default();
+        let fraction = active.map(usage_fraction).unwrap_or(0.0);
 
         div()
-            .id(SharedString::from(format!("drive-{index}")))
+            .id("drive-select")
             .flex()
             .flex_col()
             .gap(px(4.0))
             .px(px(10.0))
             .py(px(6.0))
+            .w(px(258.0))
             .rounded(px(9.0))
-            .bg(if active {
-                theme::accent_soft()
+            .bg(if open {
+                theme::surface_alt()
             } else {
                 theme::surface()
             })
             .border_1()
-            .border_color(if active { theme::accent() } else { theme::hairline() })
+            .border_color(if open { theme::accent() } else { theme::hairline() })
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_alt()))
             .on_click(cx.listener(move |this, _, _, cx| {
-                // Clicking a drive only *shows* it: a cached scan paints
-                // instantly and is not re-walked. The Rescan button is the
-                // explicit way to refresh.
-                if !this.last_root.eq_ignore_ascii_case(&root) {
-                    this.switch_to(root.clone(), cx);
-                }
+                this.drives_open = !this.drives_open;
+                cx.notify();
             }))
             .child(
                 div()
@@ -839,23 +845,28 @@ impl DiskApp {
                             .text_size(px(11.5))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme::text())
-                            .child(label),
+                            .child(title),
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(10.5))
                             .text_color(theme::text_faint())
-                            .child(format!(
-                                "{} free of {}",
-                                theme::format_bytes(drive.free),
-                                theme::format_bytes(drive.total)
-                            )),
+                            .child(usage),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(theme::text_dim())
+                            .child(if open { "▴" } else { "▾" }),
                     ),
             )
             .child(
                 div()
                     .h(px(3.0))
-                    .w(px(150.0))
+                    .w_full()
                     .rounded_full()
                     .bg(theme::track())
                     .child(
@@ -867,8 +878,119 @@ impl DiskApp {
                             } else {
                                 theme::accent()
                             })
-                            .w(px(150.0 * fraction)),
+                            .w(px(238.0 * fraction)),
                     ),
+            )
+    }
+
+    /// The open list of volumes. It is a real row of the layout rather than a
+    /// floating popup: popup layers in GPUI 0.2.2 paint but never receive
+    /// presses, so a dropdown would look right and be dead to the mouse.
+    fn drives_panel(&self, cx: &mut Context<Self>) -> Div {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, drive) in self.drives.iter().enumerate() {
+            let active = drive.root.eq_ignore_ascii_case(&self.last_root);
+            let fraction = usage_fraction(drive);
+            let root = drive.root.clone();
+            let title = drive_title(drive);
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("drive-option-{index}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(10.0))
+                    .py(px(7.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(if active {
+                        theme::accent_soft()
+                    } else {
+                        theme::surface()
+                    })
+                    .hover(|style| style.bg(theme::surface_alt()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.drives_open = false;
+                        // Picking the volume that is already open just closes
+                        // the list; a cached volume paints from memory.
+                        if !this.last_root.eq_ignore_ascii_case(&root) {
+                            this.switch_to(root.clone(), cx);
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(14.0))
+                            .text_size(px(10.0))
+                            .text_color(theme::accent())
+                            .child(if active { "●" } else { "" }),
+                    )
+                    .child(
+                        div()
+                            .w(px(196.0))
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::text())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(10.5))
+                            .text_color(theme::text_faint())
+                            .child(format!(
+                                "{} free of {}",
+                                theme::format_bytes(drive.free),
+                                theme::format_bytes(drive.total)
+                            )),
+                    )
+                    .child(
+                        div()
+                            .h(px(3.0))
+                            .w(px(120.0))
+                            .rounded_full()
+                            .bg(theme::track())
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(if fraction > 0.9 {
+                                        theme::danger()
+                                    } else {
+                                        theme::accent()
+                                    })
+                                    .w(px(120.0 * fraction)),
+                            ),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .px(px(PAD))
+            .pb(px(8.0))
+            .pt(px(2.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .p(px(6.0))
+                    .rounded(px(11.0))
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .pb(px(3.0))
+                            .text_size(px(9.5))
+                            .text_color(theme::text_faint())
+                            .child(format!("VOLUMES · {} · click to open", self.drives.len())),
+                    )
+                    .children(rows),
             )
     }
 
@@ -1702,7 +1824,9 @@ impl DiskApp {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.menu.is_some() {
+                if self.drives_open {
+                    self.drives_open = false;
+                } else if self.menu.is_some() {
                     self.menu = None;
                 } else if matches!(self.phase, Phase::Scanning) {
                     self.cancel_scan(cx);
@@ -2468,6 +2592,25 @@ impl Delta {
 /// The node one ring above `path` — the tree's own parent link, which is what
 /// "Up" means on the chart.
 ///
+/// `C:` or `G:  Google Drive` — the volume as the select and the list show it.
+fn drive_title(drive: &DriveInfo) -> String {
+    let root = drive.root.trim_end_matches('\\');
+    if drive.label.is_empty() {
+        root.to_string()
+    } else {
+        format!("{}  {}", root, drive.label)
+    }
+}
+
+/// How much of the volume is in use, as 0..=1.
+fn usage_fraction(drive: &DriveInfo) -> f32 {
+    if drive.total == 0 {
+        return 0.0;
+    }
+    let used = drive.total.saturating_sub(drive.free);
+    used as f32 / drive.total as f32
+}
+
 /// `to_dto` folds a chain of single-child folders into one node (`a/b/c`), so
 /// path arithmetic would land on a prefix that the tree happens to expose as
 /// some unrelated node (the file `app.asar.unpacked` next to the folded
@@ -2716,7 +2859,14 @@ impl Render for DiskApp {
             .text_size(px(13.0))
             .font_family("Segoe UI")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
-            .child(self.top_bar(cx))
+            .child(self.top_bar(cx));
+
+        // The volume list opens as a row of the layout, right under the select.
+        if self.drives_open {
+            root = root.child(self.drives_panel(cx));
+        }
+
+        root = root
             .child(
                 div()
                     .flex_1()

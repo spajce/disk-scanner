@@ -40,14 +40,17 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
   in the top bar.
 - **Focus card actions**: everything that acts on the open folder lives beside its name — the
   `↑ Up` button next to the clickable path, then *Rescan folder*, *↗ Reveal* and *🗑 Delete…*
-  in one row. The top bar keeps only global controls (volumes, view, metric, theme).
+  in one row. The top bar keeps only global controls (volume select, view, metric, theme).
 - **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or
   `F5` / `Ctrl+R`) re-walks just that subtree and pushes the size difference back through the
   ancestors instead of re-reading the whole volume; at the root the same button re-walks the
   volume.
-- **Volume switching never rescans or blanks out**: a volume already walked in this session
-  is painted from memory the instant you click its chip; only a volume you have never
-  scanned starts a walk. Refreshing is always explicit (`F5` / `Ctrl+R` / *Rescan*).
+- **Volume switching never rescans or blanks out**: the top bar holds a volume select — it
+  names the open drive with its free/total space and a usage bar, and its list of volumes
+  drops down underneath it (the list is a real row of the layout, because GPUI 0.2.2 popup
+  layers paint but never receive clicks). A volume already walked in this session is painted
+  from memory the instant you pick it; only a volume you have never scanned starts a walk.
+  Refreshing is always explicit (`F5` / `Ctrl+R` / *Rescan*).
 - **Auto / Dark / Light theme**: the `◐` toggle follows the Windows app theme by default and
   remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
 - **Keyboard**: `Backspace` / `↑` / `←` zoom out one ring (folded chain folders included),
@@ -145,7 +148,8 @@ scripts\rust-env.ps1 cargo build --release
 
 The app remembers the last scanned root in `%APPDATA%\disk-scanner\last-root.txt` and
 rescans it on start (falling back to the first fixed drive). Scans are cached per volume for the
-session, so switching between drives repaints instantly and refreshes behind the chart.
+session, so picking a drive you already walked repaints instantly; a never-seen drive starts a
+walk that shows the cached chart under a progress pill.
 
 ### How fast the walk is
 
