@@ -6,4 +6,4 @@ pub mod drives;
 pub mod scanner;
 
 pub use drives::{list as list_drives, DriveInfo};
-pub use scanner::{scan, to_dto, NodeDto, RawNode, ScanCounters};
+pub use scanner::{scan, scan_pausable, to_dto, NodeDto, RawNode, ScanCounters};

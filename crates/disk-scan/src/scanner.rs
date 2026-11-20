@@ -129,12 +129,35 @@ pub struct NodeDto {
 
 /// Walk `root` and return the raw tree.
 pub fn scan(root: &Path, cancel: &AtomicBool, counters: &ScanCounters) -> Result<RawNode, String> {
+    scan_with(root, cancel, None, counters)
+}
+
+/// Walk `root` like [`scan`], but hold still while `pause` is set.
+///
+/// Pausing keeps the walker's counters and partial tree alive, so clearing the
+/// flag continues the same walk instead of starting it over. `cancel` still
+/// wins: it releases paused walkers so the scan can unwind.
+pub fn scan_pausable(
+    root: &Path,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    counters: &ScanCounters,
+) -> Result<RawNode, String> {
+    scan_with(root, cancel, Some(pause), counters)
+}
+
+fn scan_with(
+    root: &Path,
+    cancel: &AtomicBool,
+    pause: Option<&AtomicBool>,
+    counters: &ScanCounters,
+) -> Result<RawNode, String> {
     let meta = std::fs::metadata(root)
         .map_err(|err| format!("Cannot open {}: {}", root.display(), err))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
-    Ok(walk(root, cancel, counters, 0))
+    Ok(walk(root, cancel, pause, counters, 0))
 }
 
 /// What one directory listing turned up, without touching the filesystem again.
@@ -308,7 +331,22 @@ fn list_dir(dir: &Path) -> Option<Listing> {    use windows_sys::Win32::Foundati
 }
 
 
-fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) -> RawNode {
+/// Block while `pause` is set. Polling lets a cancel release a paused walk
+/// without waiting for a resume; the loop costs one wakeup per idle thread.
+fn wait_while_paused(cancel: &AtomicBool, pause: Option<&AtomicBool>) {
+    let Some(pause) = pause else { return };
+    while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn walk(
+    dir: &Path,
+    cancel: &AtomicBool,
+    pause: Option<&AtomicBool>,
+    counters: &ScanCounters,
+    depth: usize,
+) -> RawNode {
     let mut node = RawNode {
         name: node_name(dir),
         path: display_path(dir),
@@ -321,6 +359,13 @@ fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) 
     };
 
     if depth > MAX_DEPTH || cancel.load(Ordering::Relaxed) {
+        return node;
+    }
+
+    // Stop parks the walker here, at a directory boundary. The partial tree and
+    // the counters stay alive, so Continue resumes the same walk.
+    wait_while_paused(cancel, pause);
+    if cancel.load(Ordering::Relaxed) {
         return node;
     }
 
@@ -382,13 +427,13 @@ fn walk(dir: &Path, cancel: &AtomicBool, counters: &ScanCounters, depth: usize) 
         listing
             .subdirs
             .par_iter()
-            .map(|subdir| walk(subdir, cancel, counters, depth + 1))
+            .map(|subdir| walk(subdir, cancel, pause, counters, depth + 1))
             .collect()
     } else {
         listing
             .subdirs
             .iter()
-            .map(|subdir| walk(subdir, cancel, counters, depth + 1))
+            .map(|subdir| walk(subdir, cancel, pause, counters, depth + 1))
             .collect()
     };
 
@@ -627,6 +672,37 @@ mod tests {
 
     fn scan_tree(path: &Path) -> RawNode {
         scan(path, &AtomicBool::new(false), &ScanCounters::new()).unwrap()
+    }
+
+    #[test]
+    fn a_paused_walk_holds_its_counters_and_resumes() {
+        let tree = TempTree::new("pause");
+        tree.file("a.bin", 1024);
+        tree.file("sub/b.bin", 2048);
+
+        let cancel = AtomicBool::new(false);
+        let pause = AtomicBool::new(true);
+        let counters = ScanCounters::new();
+
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| {
+                scan_pausable(&tree.0, &cancel, &pause, &counters)
+                    .expect("a paused scan can still finish")
+                    .size
+            });
+
+            // The walker must be parked at its first pause gate, not counting.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(!walk.is_finished(), "a paused walk must not run to completion");
+            assert_eq!(
+                counters.files.load(Ordering::Relaxed),
+                0,
+                "a paused walk must not count files"
+            );
+
+            pause.store(false, Ordering::Relaxed);
+            assert_eq!(walk.join().unwrap(), 3072);
+        });
     }
 
     #[test]

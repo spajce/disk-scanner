@@ -46,7 +46,8 @@ is described [below](#building).
   on the chart itself, so it works in every view and never hands the click back to the chart
   underneath.
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
-  in the top bar.
+  in the top bar. *Stop* parks the walker — counters and partial tree intact — and turns the
+  progress pill (or the empty card) into *Continue*, which resumes exactly where it stopped.
 - **Focus card actions**: everything that acts on the open folder lives beside its name — the
   `↑ Up` button next to the clickable path, then *Rescan folder*, *↗ Reveal* and *🗑 Delete…*
   in one row. The top bar keeps only global controls (volume select, view, metric, theme).
@@ -64,7 +65,7 @@ is described [below](#building).
   remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
 - **Keyboard**: `Backspace` / `↑` / `←` zoom out one ring (folded chain folders included),
   `1` / `2` / `3` switch views, `F5` / `Ctrl+R` rescan the open folder, `Esc` closes the
-  menu, dialog or tooltip (or stops a running scan).
+  menu, dialog or tooltip (or pauses a running scan).
 
 No webview: the window, the chart and the panels are drawn by GPUI directly.
 

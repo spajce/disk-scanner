@@ -16,7 +16,7 @@ use gpui::{
     WindowOptions,
 };
 
-use disk_scan::{list_drives, scan, to_dto, DriveInfo, ScanCounters};
+use disk_scan::{list_drives, scan_pausable, to_dto, DriveInfo, ScanCounters};
 
 use crate::model::{
     build_chart, heatmap, hit, log_rank, short_name, treemap, ChartModel, Geom, Kind, Metric, Node,
@@ -32,12 +32,27 @@ const PAD: f32 = 14.0;
 
 struct ScanJob {
     cancel: Arc<AtomicBool>,
+    /// Set while the walk is parked; cleared by Continue.
+    pause: Arc<AtomicBool>,
     generation: u64,
+    /// Wall time spent parked, kept out of the reported scan duration.
+    paused: Duration,
+    paused_since: Option<Instant>,
+}
+
+impl ScanJob {
+    /// Abandon the walk: cancel it and release it if it is parked on `pause`.
+    fn abort(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.pause.store(false, Ordering::Relaxed);
+    }
 }
 
 enum Phase {
     Empty,
     Scanning,
+    /// The walk is parked and keeps its counters; Continue resumes it.
+    Stopped,
     Ready {
         elapsed: f64,
         files: u64,
@@ -313,7 +328,7 @@ impl DiskApp {
                 let tree = cached.tree.clone();
                 let elapsed = cached.elapsed;
                 if let Some(job) = &self.job {
-                    job.cancel.store(true, Ordering::Relaxed);
+                    job.abort();
                 }
                 self.job = None;
                 self.generation += 1;
@@ -367,29 +382,42 @@ impl DiskApp {
         cx.notify();
     }
 
-    fn cancel_scan(&mut self, cx: &mut Context<Self>) {
-        if let Some(job) = &self.job {
-            job.cancel.store(true, Ordering::Relaxed);
-        }
-        if self.job.is_none() && !matches!(self.phase, Phase::Scanning) {
+    /// Park the walk in progress: it keeps its counters and partial tree, so
+    /// Continue can carry on instead of starting the volume over.
+    fn stop_scan(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Scanning) {
             return;
         }
-        self.job = None;
-        self.generation += 1;
-        self.phase = match self.cache.get(&cache_key(&self.last_root)) {
-            Some(cached) => Phase::Ready {
-                elapsed: cached.elapsed,
-                files: cached.tree.files,
-                bytes: cached.tree.size,
-            },
-            None if self.chart.is_some() => Phase::Ready {
-                elapsed: 0.0,
-                files: 0,
-                bytes: 0,
-            },
-            None => Phase::Empty,
+        let Some(job) = self.job.as_mut() else {
+            return;
         };
-        self.note = Some("Scan stopped".to_string());
+        job.pause.store(true, Ordering::Relaxed);
+        if job.paused_since.is_none() {
+            job.paused_since = Some(Instant::now());
+        }
+        self.phase = Phase::Stopped;
+        self.note = Some("Continue to resume".to_string());
+        cx.notify();
+    }
+
+    /// Let the parked walker go on with the counters it already has.
+    fn continue_scan(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Stopped) {
+            return;
+        }
+        let Some(job) = self.job.as_mut() else {
+            // The job cannot normally vanish while stopped; start the volume
+            // again rather than leaving the window stuck if it somehow does.
+            let root = self.last_root.clone();
+            self.scan_into(root, false, cx);
+            return;
+        };
+        if let Some(since) = job.paused_since.take() {
+            job.paused += since.elapsed();
+        }
+        job.pause.store(false, Ordering::Relaxed);
+        self.phase = Phase::Scanning;
+        self.note = None;
         cx.notify();
     }
 
@@ -417,15 +445,19 @@ impl DiskApp {
 
     fn scan_into(&mut self, target: String, subtree: bool, cx: &mut Context<Self>) {
         if let Some(job) = &self.job {
-            job.cancel.store(true, Ordering::Relaxed);
+            job.abort();
         }
         self.generation += 1;
         let generation = self.generation;
         let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
         let counters = Arc::new(ScanCounters::new());
         self.job = Some(ScanJob {
             cancel: cancel.clone(),
+            pause: pause.clone(),
             generation,
+            paused: Duration::ZERO,
+            paused_since: None,
         });
         self.phase = Phase::Scanning;
         self.progress = (0, 0, target.clone());
@@ -437,7 +469,7 @@ impl DiskApp {
         if subtree {
             // Keep the chart and the volume totals; only the pill changes.
             cx.notify();
-            self.spawn_scan(target, subtree, generation, cancel, counters, cx);
+            self.spawn_scan(target, subtree, generation, cancel, pause, counters, cx);
             return;
         }
 
@@ -459,7 +491,7 @@ impl DiskApp {
             self.tree = Some(tree);
         }
         cx.notify();
-        self.spawn_scan(target, subtree, generation, cancel, counters, cx);
+        self.spawn_scan(target, subtree, generation, cancel, pause, counters, cx);
     }
 
     fn spawn_scan(
@@ -468,12 +500,15 @@ impl DiskApp {
         subtree: bool,
         generation: u64,
         cancel: Arc<AtomicBool>,
+        pause: Arc<AtomicBool>,
         counters: Arc<ScanCounters>,
         cx: &mut Context<Self>,
     ) {
         // Progress: a cheap snapshot every 120 ms, so the UI stays live while
-        // the walker chews through millions of files.
+        // the walker chews through millions of files. While parked there is
+        // nothing new to show, so the ticker keeps sleeping without notifying.
         let tick_counters = counters.clone();
+        let tick_pause = pause.clone();
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -482,6 +517,9 @@ impl DiskApp {
                 let keep_going = this.update(cx, |this, cx| {
                     if this.job.as_ref().map(|job| job.generation) != Some(generation) {
                         return false;
+                    }
+                    if tick_pause.load(Ordering::Relaxed) {
+                        return true;
                     }
                     let (files, _, bytes, _, path) = tick_counters.snapshot();
                     this.progress = (files, bytes, path);
@@ -501,7 +539,7 @@ impl DiskApp {
         cx.spawn(async move |this, cx| {
             let work = cx.background_spawn(async move {
                 let started = Instant::now();
-                match scan(Path::new(&walk_root), &cancel, &counters) {
+                match scan_pausable(Path::new(&walk_root), &cancel, &pause, &counters) {
                     Ok(raw) => {
                         let total = raw.size;
                         let dto = to_dto(&raw, total);
@@ -530,7 +568,19 @@ impl DiskApp {
         if self.generation != generation {
             return;
         }
+        let paused = self
+            .job
+            .as_ref()
+            .map(|job| {
+                job.paused
+                    + job
+                        .paused_since
+                        .map(|since| since.elapsed())
+                        .unwrap_or_default()
+            })
+            .unwrap_or_default();
         self.job = None;
+        self.note = None;
         match result {
             Ok((tree, elapsed, cancelled)) => {
                 if cancelled {
@@ -550,6 +600,9 @@ impl DiskApp {
                     cx.notify();
                     return;
                 }
+
+                // Time spent parked on Stop is not time spent scanning.
+                let elapsed = (elapsed - paused.as_secs_f64()).max(0.0);
 
                 // A folder refresh only replaces that one subtree and pushes the
                 // size difference up through its ancestors.
@@ -1493,6 +1546,8 @@ impl DiskApp {
         }
         if scanning {
             area = area.child(self.scan_pill(cx));
+        } else if matches!(self.phase, Phase::Stopped) {
+            area = area.child(self.stopped_pill(cx));
         }
         area
     }
@@ -1715,6 +1770,8 @@ impl DiskApp {
         }
         if scanning {
             area = area.child(self.scan_pill(cx));
+        } else if matches!(self.phase, Phase::Stopped) {
+            area = area.child(self.stopped_pill(cx));
         }
         area
     }
@@ -1754,7 +1811,37 @@ impl DiskApp {
                             theme::format_bytes(*bytes)
                         )),
                     )
-                    .child(self.action_button("Stop", cx, |this, cx| this.cancel_scan(cx))),
+                    .child(self.action_button("Stop", cx, |this, cx| this.stop_scan(cx))),
+            )
+    }
+
+    /// The pill a stopped scan leaves over the chart it was refreshing. The
+    /// chart keeps the cached numbers, and Continue lets the parked walk go on.
+    fn stopped_pill(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .top(px(8.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .pl(px(13.0))
+                    .pr(px(5.0))
+                    .py(px(5.0))
+                    .rounded_full()
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .text_size(px(11.0))
+                    .text_color(theme::text_dim())
+                    .child(div().text_color(theme::text_faint()).child("●"))
+                    .child("Scan stopped")
+                    .child(self.action_button("Continue", cx, |this, cx| this.continue_scan(cx))),
             )
     }
 
@@ -1762,8 +1849,10 @@ impl DiskApp {
     fn scan_card(&self, cx: &mut Context<Self>) -> Div {
         let (files, bytes, path) = &self.progress;
         let scanning = matches!(self.phase, Phase::Scanning);
+        let stopped = matches!(self.phase, Phase::Stopped);
         let title = match &self.phase {
             Phase::Scanning => format!("Scanning {}…", self.last_root),
+            Phase::Stopped => "Scan stopped".to_string(),
             Phase::Failed(error) => format!("Could not scan: {error}"),
             Phase::Ready { .. } => "Waiting for the first scan…".to_string(),
             Phase::Empty => "Waiting for a drive…".to_string(),
@@ -1786,7 +1875,9 @@ impl DiskApp {
                     .text_color(theme::text())
                     .child(title),
             );
-        if scanning {
+        if scanning || stopped {
+            // A stopped walk has no chart yet, so this card is the only place
+            // the progress it reached is visible.
             card = card
                 .child(
                     div()
@@ -1804,8 +1895,12 @@ impl DiskApp {
                         .text_color(theme::text_faint())
                         .truncate()
                         .child(short_name(path, 60)),
-                )
-                .child(self.action_button("Stop", cx, |this, cx| this.cancel_scan(cx)));
+                );
+        }
+        if scanning {
+            card = card.child(self.action_button("Stop", cx, |this, cx| this.stop_scan(cx)));
+        } else if stopped {
+            card = card.child(self.action_button("Continue", cx, |this, cx| this.continue_scan(cx)));
         }
         card
     }
@@ -1984,7 +2079,7 @@ impl DiskApp {
                 } else if self.menu.is_some() {
                     self.menu = None;
                 } else if matches!(self.phase, Phase::Scanning) {
-                    self.cancel_scan(cx);
+                    self.stop_scan(cx);
                 } else {
                     self.hover = None;
                     self.tooltip = None;
@@ -2316,9 +2411,18 @@ impl DiskApp {
                         theme::format_bytes(*bytes),
                         short_name(path, 46)
                     ),
-                    "Esc / hub click to stop".to_string(),
+                    "Esc or Stop to pause".to_string(),
                 )
             }
+            Phase::Stopped => (
+                format!(
+                    "Scan stopped · {} files · {} · {}",
+                    theme::format_count(self.progress.0),
+                    theme::format_bytes(self.progress.1),
+                    short_name(&self.progress.2, 46)
+                ),
+                self.note.clone().unwrap_or_default(),
+            ),
             Phase::Ready {
                 elapsed,
                 files,
