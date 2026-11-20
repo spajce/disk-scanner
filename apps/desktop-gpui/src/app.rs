@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, linear_color_stop, linear_gradient, point, px, quad, size, AnyElement, App, BorderStyle, Bounds,
+    canvas, div, linear_color_stop, linear_gradient, point, px, quad, size,
+    AnyElement, App, BorderStyle, Bounds,
     Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, Render, SharedString, Window,
     WindowOptions,
@@ -51,10 +52,41 @@ struct Tooltip {
     index: usize,
 }
 
+#[derive(Clone)]
 struct Menu {
     x: f32,
     y: f32,
     node: Arc<Node>,
+}
+
+// The context menu is painted by the chart canvas and hit-tested from the
+// pointer position, because GPUI's popup layers paint at the right place but
+// never receive presses on this backend.
+const MENU_W: f32 = 232.0;
+const MENU_PAD: f32 = 5.0;
+const MENU_HEADER_H: f32 = 22.0;
+const MENU_ROW_H: f32 = 26.0;
+const MENU_SEP_H: f32 = 7.0;
+const MENU_H: f32 = MENU_PAD * 2.0 + MENU_HEADER_H + 1.0 + MENU_ROW_H + MENU_SEP_H + MENU_ROW_H;
+const MENU_REVEAL_TOP: f32 = MENU_PAD + MENU_HEADER_H + 1.0;
+const MENU_DELETE_TOP: f32 = MENU_REVEAL_TOP + MENU_ROW_H + MENU_SEP_H;
+
+fn menu_row_at(menu: &Menu, x: f32, y: f32) -> Option<usize> {
+    if x < menu.x || x > menu.x + MENU_W || y < menu.y || y > menu.y + MENU_H {
+        return None;
+    }
+    let top = y - menu.y;
+    if top >= MENU_REVEAL_TOP && top < MENU_REVEAL_TOP + MENU_ROW_H {
+        Some(0)
+    } else if top >= MENU_DELETE_TOP && top < MENU_DELETE_TOP + MENU_ROW_H {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn menu_contains(menu: &Menu, x: f32, y: f32) -> bool {
+    x >= menu.x && x <= menu.x + MENU_W && y >= menu.y && y <= menu.y + MENU_H
 }
 
 struct Placed {
@@ -88,6 +120,8 @@ pub struct DiskApp {
     hover: Option<usize>,
     tooltip: Option<Tooltip>,
     menu: Option<Menu>,
+    /// Row under the pointer inside the open context menu (0 reveal, 1 delete).
+    menu_hover: Option<usize>,
     placed: Arc<Mutex<Placed>>,
     last_root: String,
     note: Option<String>,
@@ -136,6 +170,7 @@ impl DiskApp {
             hover: None,
             tooltip: None,
             menu: None,
+            menu_hover: None,
             placed,
             last_root: last_root.clone(),
             note: None,
@@ -626,6 +661,7 @@ impl DiskApp {
 
     fn remove_subtree(&mut self, target: &str, cx: &mut Context<Self>) {
         let Some(tree) = self.tree.clone() else { return };
+        let removed = Node::find(&tree, target);
         let pruned = prune(&tree, target);
         let mut focus = self.focus_path.clone();
         if focus.to_lowercase().starts_with(&target.to_lowercase()) {
@@ -633,6 +669,11 @@ impl DiskApp {
         }
         self.tree = Some(pruned.clone());
         self.focus_path = focus;
+        // The status bar shows what the walk found; a delete makes that stale.
+        if let (Some(removed), Phase::Ready { files, bytes, .. }) = (removed, &mut self.phase) {
+            *files = files.saturating_sub(removed.files);
+            *bytes = bytes.saturating_sub(removed.size);
+        }
         let node = Node::find(&pruned, &self.focus_path).unwrap_or(pruned);
         self.chart = Some(Arc::new(build_chart(node, self.metric)));
         self.hover = None;
@@ -964,8 +1005,10 @@ impl DiskApp {
         let chain = hover.map(|index| ancestors(&chart, index)).unwrap_or_default();
 
         let mut labels: Vec<AnyElement> = Vec::new();
+        // While the context menu is up its own labels are the only text worth
+        // showing; slice names would bleed through the card.
         for (index, slice) in chart.slices.iter().enumerate() {
-            if slice.depth > 3 {
+            if self.menu.is_some() || slice.depth > 3 {
                 continue;
             }
             let (r0, r1) = geom.ring_bounds(slice.depth);
@@ -1006,6 +1049,43 @@ impl DiskApp {
             }
         }
 
+        if let Some(menu) = &self.menu {
+            let origin = self
+                .placed
+                .lock()
+                .map(|slot| slot.origin)
+                .unwrap_or_else(|_| point(px(0.), px(0.)));
+            let delete_label = if menu.node.is_dir() {
+                "Delete folder…"
+            } else {
+                "Delete file…"
+            };
+            labels.push(menu_label(
+                menu,
+                origin,
+                9.0,
+                short_name(&menu.node.name, 30),
+                theme::text_faint(),
+                FontWeight::NORMAL,
+            ));
+            labels.push(menu_label(
+                menu,
+                origin,
+                MENU_REVEAL_TOP + 7.0,
+                "Reveal in Explorer".to_string(),
+                theme::text(),
+                FontWeight::NORMAL,
+            ));
+            labels.push(menu_label(
+                menu,
+                origin,
+                MENU_DELETE_TOP + 7.0,
+                delete_label.to_string(),
+                theme::danger(),
+                FontWeight::NORMAL,
+            ));
+        }
+
         let hub_name = short_name(&chart.focus.name, 18);
         let hub_value = match self.metric {
             Metric::Bytes => theme::format_bytes(chart.focus.size),
@@ -1022,6 +1102,8 @@ impl DiskApp {
         let store_prepaint = placed.clone();
         let chart_paint = chart.clone();
         let store_paint = placed.clone();
+        let menu_paint = self.menu.clone();
+        let menu_hover = self.menu_hover;
         let mut area = div()
             .relative()
             .flex_1()
@@ -1053,6 +1135,9 @@ impl DiskApp {
                                     .map(|slot| slot.origin)
                                     .unwrap_or_else(|_| point(px(0.), px(0.)));
                                 paint_sunburst(window, origin, &geom, &chart_paint, hover, &chain);
+                                if let Some(menu) = &menu_paint {
+                                    paint_menu(window, origin, menu, menu_hover);
+                                }
                             },
                         )
                         .size_full(),
@@ -1099,8 +1184,8 @@ impl DiskApp {
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.on_chart_right_click(event, cx);
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            this.on_chart_right_click(event, window, cx);
                         }),
                     ),
             );
@@ -1215,6 +1300,45 @@ impl DiskApp {
         let chart_paint = chart.clone();
         let store_prepaint = self.placed.clone();
         let paint_chain = chain.clone();
+        let menu_paint_tiles = self.menu.clone();
+        let menu_hover_tiles = self.menu_hover;
+
+        if let Some(menu) = &self.menu {
+            let origin = self
+                .placed
+                .lock()
+                .map(|slot| slot.origin)
+                .unwrap_or_else(|_| point(px(0.), px(0.)));
+            let delete_label = if menu.node.is_dir() {
+                "Delete folder…"
+            } else {
+                "Delete file…"
+            };
+            labels.push(menu_label(
+                menu,
+                origin,
+                9.0,
+                short_name(&menu.node.name, 30),
+                theme::text_faint(),
+                FontWeight::NORMAL,
+            ));
+            labels.push(menu_label(
+                menu,
+                origin,
+                MENU_REVEAL_TOP + 7.0,
+                "Reveal in Explorer".to_string(),
+                theme::text(),
+                FontWeight::NORMAL,
+            ));
+            labels.push(menu_label(
+                menu,
+                origin,
+                MENU_DELETE_TOP + 7.0,
+                delete_label.to_string(),
+                theme::danger(),
+                FontWeight::NORMAL,
+            ));
+        }
 
         let mut area = div().relative().flex_1().min_w_0().child(
             div()
@@ -1248,6 +1372,9 @@ impl DiskApp {
                                 hover,
                                 &paint_chain,
                             );
+                            if let Some(menu) = &menu_paint_tiles {
+                                paint_menu(window, bounds.origin, menu, menu_hover_tiles);
+                            }
                         },
                     )
                     .size_full(),
@@ -1264,8 +1391,8 @@ impl DiskApp {
                 )
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        this.on_chart_right_click(event, cx);
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        this.on_chart_right_click(event, window, cx);
                     }),
                 ),
         );
@@ -1399,6 +1526,20 @@ impl DiskApp {
     }
 
     fn on_chart_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // The menu takes over the pointer: rows light up, the chart stops
+        // tracking hover so its tooltip does not fight the menu for space.
+        if let Some(menu) = &self.menu {
+            let hover = menu_row_at(menu, f32::from(event.position.x), f32::from(event.position.y));
+            if hover != self.menu_hover {
+                self.menu_hover = hover;
+                if self.hover.is_some() || self.tooltip.is_some() {
+                    self.hover = None;
+                    self.tooltip = None;
+                }
+                cx.notify();
+            }
+            return;
+        }
         let picked = self.pick(event.position);
         let next = picked.map(|(index, _, _)| index);
         if next == self.hover && self.tooltip.is_some() {
@@ -1410,6 +1551,25 @@ impl DiskApp {
     }
 
     fn on_chart_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // A press on an open menu resolves against its rows; a press anywhere
+        // else dismisses it. Either way the chart underneath stays put.
+        if let Some(menu) = self.menu.clone() {
+            let x = f32::from(event.position.x);
+            let y = f32::from(event.position.y);
+            let row = menu_row_at(&menu, x, y);
+            let inside = menu_contains(&menu, x, y);
+            self.menu = None;
+            self.menu_hover = None;
+            match row {
+                Some(0) => crate::sys::reveal(&menu.node.path, menu.node.is_dir()),
+                Some(1) => self.ask_delete(menu.node, cx),
+                _ => {}
+            }
+            cx.notify();
+            if inside {
+                return;
+            }
+        }
         let Some(chart) = self.chart.clone() else {
             return;
         };
@@ -1444,13 +1604,41 @@ impl DiskApp {
         }
     }
 
-    fn on_chart_right_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if let Some((index, x, y)) = self.pick(event.position) {
+    fn on_chart_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A right press on an open menu just dismisses it.
+        if let Some(menu) = self.menu.clone() {
+            self.menu = None;
+            self.menu_hover = None;
+            if menu_contains(&menu, f32::from(event.position.x), f32::from(event.position.y)) {
+                cx.notify();
+                return;
+            }
+        }
+        let picked = self.pick(event.position);
+        if let Some((index, x, y)) = picked {
             let chart = self.chart.clone();
             if let Some(chart) = chart {
                 let node = chart.slices[index].node.clone();
                 if node.kind != Kind::Other && !node.path.is_empty() {
-                    self.menu = Some(Menu { x, y, node });
+                    // Keep the card inside the window: it is painted by the
+                    // canvas, which cannot scroll itself back into view.
+                    let viewport = window.viewport_size();
+                    let max_x = f32::from(viewport.width) - MENU_W - 8.0;
+                    let max_y = f32::from(viewport.height) - MENU_H - 8.0;
+                    self.menu = Some(Menu {
+                        x: x.min(max_x).max(8.0),
+                        y: y.min(max_y).max(8.0),
+                        node,
+                    });
+                    // The tooltip would otherwise sit on top of the card.
+                    self.hover = None;
+                    self.tooltip = None;
+                    self.menu_hover = None;
                     cx.notify();
                 }
             }
@@ -1703,7 +1891,7 @@ impl DiskApp {
                             cx,
                             |this, _| {
                                 if let Some(focus) = this.focus() {
-                                    crate::sys::reveal(&focus.path);
+                                    crate::sys::reveal(&focus.path, focus.is_dir());
                                 }
                             },
                         )),
@@ -1785,7 +1973,7 @@ impl DiskApp {
             .child(div().truncate().child(right))
     }
 
-    fn overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn overlays(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut layers: Vec<AnyElement> = Vec::new();
 
         if let (Some(tooltip), Some(chart)) = (&self.tooltip, &self.chart) {
@@ -1848,69 +2036,6 @@ impl DiskApp {
             }
         }
 
-        if let Some(menu) = &self.menu {
-            let node = menu.node.clone();
-            let has_path = !node.path.is_empty() && node.kind != Kind::Other;
-            let delete_label = if node.is_dir() {
-                "Delete folder…"
-            } else {
-                "Delete file…"
-            };
-            let reveal_node = node.clone();
-            let delete_node = node.clone();
-
-            layers.push(
-                div()
-                    .absolute()
-                    .left(px(0.))
-                    .top(px(0.))
-                    .w_full()
-                    .h_full()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element(),
-            );
-
-            layers.push(
-                div()
-                    .absolute()
-                    .left(px(menu.x))
-                    .top(px(menu.y))
-                    .w(px(232.0))
-                    .p(px(5.0))
-                    .rounded(px(10.0))
-                    .bg(theme::surface_alt())
-                    .border_1()
-                    .border_color(theme::hairline())
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .px(px(9.0))
-                            .py(px(4.0))
-                            .text_size(px(9.5))
-                            .text_color(theme::text_faint())
-                            .truncate()
-                            .child(short_name(&node.name, 30)),
-                    )
-                    .child(menu_item("Reveal in Explorer", false, has_path, cx, move |this, cx| {
-                        crate::sys::reveal(&reveal_node.path);
-                        this.menu = None;
-                        cx.notify();
-                    }))
-                    .child(div().h(px(1.0)).my(px(3.0)).bg(theme::hairline()))
-                    .child(menu_item(delete_label, true, has_path, cx, move |this, cx| {
-                        this.ask_delete(delete_node.clone(), cx);
-                    }))
-                    .into_any_element(),
-            );
-        }
 
         layers
     }
@@ -1970,39 +2095,89 @@ fn stat(label: &str, value: String) -> Div {
         )
 }
 
-fn menu_item(
-    label: &str,
-    danger: bool,
-    enabled: bool,
-    cx: &mut Context<DiskApp>,
-    action: impl Fn(&mut DiskApp, &mut Context<DiskApp>) + 'static,
-) -> gpui::Stateful<Div> {
-    let base = div()
-        .id(SharedString::from(format!("menu-{label}")))
-        .px(px(9.0))
-        .py(px(6.0))
-        .rounded(px(6.0))
-        .text_size(px(11.5))
-        .child(label.to_string());
+/// Draws the context menu onto the chart canvas.
+///
+/// The card is painted from the canvas rather than a popup layer because popup
+/// layers in this GPUI build paint correctly but never receive presses; presses
+/// are resolved from the pointer position instead.
+fn paint_menu(
+    window: &mut Window,
+    _origin: Point<Pixels>,
+    menu: &Menu,
+    hover: Option<usize>,
+) {
+    // Canvas paint coordinates are window coordinates, like `paint_sunburst`.
+    let x = px(menu.x);
+    let y = px(menu.y);
 
-    if !enabled {
-        return base.text_color(theme::text_faint()).opacity(0.5);
+    let card = Bounds {
+        origin: point(x, y),
+        size: size(px(MENU_W), px(MENU_H)),
+    };
+    window.paint_quad(quad(
+        card,
+        px(9.0),
+        theme::surface_alt(),
+        px(1.0),
+        theme::hairline(),
+        BorderStyle::Solid,
+    ));
+
+    for (index, top) in [(0usize, MENU_REVEAL_TOP), (1usize, MENU_DELETE_TOP)] {
+        if hover == Some(index) {
+            let row = Bounds {
+                origin: point(x + px(4.0), y + px(top)),
+                size: size(px(MENU_W - 8.0), px(MENU_ROW_H)),
+            };
+            window.paint_quad(quad(
+                row,
+                px(6.0),
+                theme::hairline(),
+                px(0.0),
+                theme::hairline(),
+                BorderStyle::Solid,
+            ));
+        }
     }
 
-    let base = base
-        .cursor_pointer()
-        .text_color(if danger {
-            theme::danger()
-        } else {
-            theme::text()
-        })
-        .hover(|style| style.bg(theme::hairline()))
-        .on_click(cx.listener(move |this, _, _, cx| action(this, cx)));
-    base
+    // Divider between "Reveal" and the destructive row.
+    let divider = Bounds {
+        origin: point(x + px(6.0), y + px(MENU_REVEAL_TOP + MENU_ROW_H + 3.0)),
+        size: size(px(MENU_W - 12.0), px(1.0)),
+    };
+    window.paint_quad(quad(
+        divider,
+        px(0.0),
+        theme::hairline(),
+        px(0.0),
+        theme::hairline(),
+        BorderStyle::Solid,
+    ));
 }
 
-fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {
-    let mut set = HashSet::new();
+/// Text for the painted menu: one absolutely placed label per line.
+fn menu_label(
+    menu: &Menu,
+    origin: Point<Pixels>,
+    top: f32,
+    text: String,
+    color: gpui::Rgba,
+    weight: FontWeight,
+) -> AnyElement {
+    let x = menu.x - f32::from(origin.x);
+    let y = menu.y - f32::from(origin.y);
+    div()
+        .absolute()
+        .left(px(x + 9.0))
+        .top(px(y + top))
+        .text_size(px(11.5))
+        .text_color(color)
+        .font_weight(weight)
+        .child(text)
+        .into_any_element()
+}
+
+fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {    let mut set = HashSet::new();
     let mut current = index;
     loop {
         set.insert(current);

@@ -31,8 +31,11 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
   breadcrumb segment, so one click re-centres the chart on that folder (and on a folder
   outside the current scan it simply starts scanning it).
 - **Right-click actions** on a slice, a treemap cell or a breakdown row: *Reveal in
-  Explorer*, and *Delete folder* / *Delete file*, which asks first with the native Windows
-  confirmation dialog (No is the default answer) and then moves the item to the Recycle Bin.
+  Explorer* opens the clicked folder itself (a file is selected inside its parent), and
+  *Delete folder* / *Delete file* asks first with the native Windows confirmation dialog
+  (No is the default answer) and then moves the item to the Recycle Bin. The menu is drawn
+  on the chart itself, so it works in every view and never hands the click back to the chart
+  underneath.
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
 - **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or

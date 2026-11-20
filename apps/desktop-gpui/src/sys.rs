@@ -38,9 +38,11 @@ pub fn system_prefers_light() -> bool {
     status == 0 && data != 0
 }
 
-/// Reveal `path` in Explorer, selecting it when it is a file.
-pub fn reveal(path: &str) {
-    let status = if std::path::Path::new(path).is_dir() {
+/// Reveal `path` in Explorer: a folder opens itself, a file is selected inside
+/// its parent. `is_dir` comes from the scan rather than the filesystem so a
+/// folder that vanished since the scan still opens where the user expects.
+pub fn reveal(path: &str, is_dir: bool) {
+    let status = if is_dir {
         Command::new("explorer.exe").arg(path).spawn()
     } else {
         Command::new("explorer.exe")
@@ -146,6 +148,7 @@ pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
 
     // SAFETY: both strings are NUL-terminated UTF-16 and outlive the call; the
     // owner handle is a plain window handle owned by this process.
+
     let answer = unsafe {
         MessageBoxW(
             owner as *mut core::ffi::c_void,
@@ -154,6 +157,7 @@ pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
         )
     };
+
     answer == IDYES
 }
 
