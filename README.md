@@ -1,5 +1,7 @@
 # Disk Scanner
 
+[![Latest release](https://img.shields.io/github/v/release/spajce/disk-scanner)](https://github.com/spajce/disk-scanner/releases/latest)
+
 A desktop disk-usage explorer that renders a whole volume three ways — a zoomable
 **sunburst**, a cushion-shaded **treemap**, and a log-scaled **heatmap** — every folder
 level at once, sized by bytes or by file count, in the spirit of the classic Scanner
@@ -10,6 +12,13 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
 | Rings | Treemap | Heatmap |
 | --- | --- | --- |
 | ![Sunburst](docs/screenshot.png) | ![Treemap](docs/treemap.png) | ![Heatmap](docs/heatmap.png) |
+
+## Download
+
+Grab the latest `disk-scanner-*-windows-x64.zip` from the
+[releases page](https://github.com/spajce/disk-scanner/releases/latest), unpack it and run
+`disk-scanner.exe`. There is no installer and nothing else to install; building from source
+is described [below](#building).
 
 ## What it does
 
