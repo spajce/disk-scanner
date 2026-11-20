@@ -38,9 +38,13 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
   underneath.
 - **Live progress** while scanning (files, bytes, current path) plus per-volume free space
   in the top bar.
+- **Focus card actions**: everything that acts on the open folder lives beside its name — the
+  `↑ Up` button next to the clickable path, then *Rescan folder*, *↗ Reveal* and *🗑 Delete…*
+  in one row. The top bar keeps only global controls (volumes, view, metric, theme).
 - **Rescan what you are looking at**: inside a folder the *Rescan folder* button (or
-  `F5` / `Ctrl+R`) re-walks just that subtree, marks the buttons, and pushes the size
-  difference back through the ancestors instead of re-reading the whole volume.
+  `F5` / `Ctrl+R`) re-walks just that subtree and pushes the size difference back through the
+  ancestors instead of re-reading the whole volume; at the root the same button re-walks the
+  volume.
 - **Volume switching never rescans or blanks out**: a volume already walked in this session
   is painted from memory the instant you click its chip; only a volume you have never
   scanned starts a walk. Refreshing is always explicit (`F5` / `Ctrl+R` / *Rescan*).

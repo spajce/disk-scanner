@@ -747,9 +747,6 @@ impl DiskApp {
                     .child(self.metric_button("Files", Metric::Files, cx)),
             )
             .child(self.theme_button(cx))
-            .child(self.action_button(self.rescan_label(), cx, |this, cx| {
-                this.rescan_focus(cx);
-            }))
     }
 
     /// The Rescan button says what it will actually do: refresh the folder in
@@ -963,6 +960,61 @@ impl DiskApp {
             .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
             .on_click(cx.listener(move |this, _, _, cx| action(this, cx)))
             .child(label.to_string())
+    }
+
+    /// A borderless button for the focus card: navigation and secondary folder
+    /// actions belong beside the path they act on, not in the global top bar.
+    fn ghost_button(
+        &self,
+        label: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut DiskApp, &mut Context<DiskApp>) + 'static,
+    ) -> gpui::Stateful<Div> {
+        let button = div()
+            .id(SharedString::from(format!("ghost-{label}")))
+            .px(px(7.0))
+            .py(px(3.0))
+            .rounded(px(6.0))
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text_dim())
+            .child(label.to_string());
+        if !enabled {
+            return button.opacity(0.34);
+        }
+        button
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| action(this, cx)))
+    }
+
+    /// Same shape as `action_button` but tinted for a destructive action.
+    fn danger_button(
+        &self,
+        label: &str,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut DiskApp, &mut Context<DiskApp>) + 'static,
+    ) -> gpui::Stateful<Div> {
+        let button = div()
+            .id(SharedString::from(format!("danger-{label}")))
+            .px(px(9.0))
+            .py(px(5.0))
+            .rounded(px(7.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .text_size(px(11.5))
+            .text_color(theme::danger())
+            .child(label.to_string());
+        if !enabled {
+            return button.opacity(0.38);
+        }
+        button
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_alt()))
+            .on_click(cx.listener(move |this, _, _, cx| action(this, cx)))
     }
 
     fn chart_area(
@@ -1727,8 +1779,15 @@ impl DiskApp {
         };
         let focus = chart.focus.clone();
         let metric = self.metric;
-        let of_total = if chart.total > 0.0 {
-            metric.weight(&focus) / chart.total
+        // `chart.total` is the focused folder itself, so "of volume" has to be
+        // measured against the scanned root instead.
+        let volume = self
+            .tree
+            .as_ref()
+            .map(|tree| metric.weight(tree))
+            .unwrap_or(chart.total);
+        let of_total = if volume > 0.0 {
+            metric.weight(&focus) / volume
         } else {
             0.0
         };
@@ -1850,8 +1909,9 @@ impl DiskApp {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(
-                div()
+            .child({
+                let at_root = focus.path.eq_ignore_ascii_case(&self.last_root);
+                let mut card = div()
                     .flex()
                     .flex_col()
                     .gap(px(3.0))
@@ -1864,7 +1924,7 @@ impl DiskApp {
                         div()
                             .flex()
                             .items_center()
-                            .justify_between()
+                            .gap(px(6.0))
                             .child(
                                 div()
                                     .flex_1()
@@ -1873,32 +1933,66 @@ impl DiskApp {
                                     .text_size(px(15.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(focus.name.clone()),
-                            )
-                            .child(self.action_button("Up", cx, |this, cx| this.go_up(cx))),
-                    )
-                    .child(self.path_crumbs(&focus.path, cx))
-                    .child(
+                            ),
+                    );
+                // At the scan root the title already says where you are and
+                // there is nowhere to go up to, so the path row earns nothing.
+                if !at_root {
+                    card = card.child(
                         div()
-                            .mt(px(6.0))
+                            .mt(px(2.0))
                             .flex()
-                            .gap(px(18.0))
-                            .child(stat("SIZE", theme::format_bytes(focus.size)))
-                            .child(stat("FILES", theme::format_count(focus.files)))
-                            .child(stat("FOLDERS", theme::format_count(focus.dirs)))
-                            .child(stat("OF VOLUME", theme::format_percent(of_total as f64))),
-                    )
-                    .child(
-                        div().mt(px(8.0)).flex().gap(px(6.0)).child(self.action_button(
-                            "Reveal in Explorer",
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(self.ghost_button("↑ Up", true, cx, |this, cx| this.go_up(cx)))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .child(self.path_crumbs(&focus.path, cx)),
+                            ),
+                    );
+                }
+                card.child(
+                    div()
+                        .mt(px(6.0))
+                        .flex()
+                        .gap(px(18.0))
+                        .child(stat("SIZE", theme::format_bytes(focus.size)))
+                        .child(stat("FILES", theme::format_count(focus.files)))
+                        .child(stat("FOLDERS", theme::format_count(focus.dirs)))
+                        .child(stat("OF VOLUME", theme::format_percent(of_total as f64))),
+                )
+                .child(
+                    div()
+                        .mt(px(9.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(self.action_button(self.rescan_label(), cx, |this, cx| {
+                            this.rescan_focus(cx);
+                        }))
+                        .child(self.action_button("↗ Reveal", cx, |this, _| {
+                            if let Some(focus) = this.focus() {
+                                crate::sys::reveal(&focus.path, focus.is_dir());
+                            }
+                        }))
+                        .child(self.danger_button(
+                            "🗑 Delete…",
+                            self.focus().is_some_and(|focus| {
+                                focus.kind != Kind::Other
+                                    && !focus.path.is_empty()
+                                    && !focus.path.eq_ignore_ascii_case(&self.last_root)
+                            }),
                             cx,
-                            |this, _| {
+                            |this, cx| {
                                 if let Some(focus) = this.focus() {
-                                    crate::sys::reveal(&focus.path, focus.is_dir());
+                                    this.ask_delete(focus, cx);
                                 }
                             },
                         )),
-                    ),
-            )
+                )
+            })
             .child(
                 div()
                     .flex()
