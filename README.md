@@ -46,9 +46,9 @@ level at once, sized by bytes or by file count, in the spirit of the classic Sca
   scanned starts a walk. Refreshing is always explicit (`F5` / `Ctrl+R` / *Rescan*).
 - **Auto / Dark / Light theme**: the `◐` toggle follows the Windows app theme by default and
   remembers your choice in `%APPDATA%\disk-scanner\theme.txt`.
-- **Keyboard**: `Backspace` / `↑` / `←` zoom out, `1` / `2` / `3` switch views,
-  `F5` / `Ctrl+R` rescan the open folder, `Esc` closes the menu, dialog or tooltip
-  (or stops a running scan).
+- **Keyboard**: `Backspace` / `↑` / `←` zoom out one ring (folded chain folders included),
+  `1` / `2` / `3` switch views, `F5` / `Ctrl+R` rescan the open folder, `Esc` closes the
+  menu, dialog or tooltip (or stops a running scan).
 
 No webview: the window, the chart and the panels are drawn by GPUI directly.
 
@@ -92,7 +92,9 @@ the tree is compacted so a 2-million-file volume still renders smoothly:
   like) still gets a single grey "smaller items" slice, because there is nothing better to
   draw with 15 000 cells;
 - loose files below `FILE_FLOOR` are folded the same way;
-- single-child chains are collapsed into `a/b/c` slices;
+- single-child chains are collapsed into `a/b/c` slices, and *Up* follows the rings rather
+  than the raw path, so `app.asar.unpacked/dsh/node_modules` returns to `resources` even
+  though the intermediate folders are not nodes of their own;
 - the total node count is capped (`NODE_BUDGET`) and depth is bounded.
 
 The UI never walks a raw directory tree — it only lays out what the scanner decided is

@@ -246,6 +246,12 @@ impl DiskApp {
             self.set_focus(node, cx);
             return;
         }
+        // A breadcrumb segment can name the middle of a folded chain, where the
+        // only real node is the chain itself (`a\b\c`).
+        if let Some(node) = deepest_inside(&tree, &path) {
+            self.set_focus(node, cx);
+            return;
+        }
         if std::path::Path::new(&path).is_dir() {
             self.switch_to(path, cx);
         } else {
@@ -256,17 +262,11 @@ impl DiskApp {
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let Some(tree) = self.tree.clone() else { return };
-        let current = self.focus_path.clone();
-        let parent = Path::new(&current)
-            .parent()
-            .map(|parent| parent.to_string_lossy().into_owned())
-            .filter(|parent| !parent.is_empty());
-        match parent {
-            Some(parent) => {
-                if let Some(node) = Node::find(&tree, &parent) {
-                    self.set_focus(node, cx);
-                }
-            }
+        if self.focus_path.eq_ignore_ascii_case(&tree.path) {
+            return;
+        }
+        match parent_of(&tree, &self.focus_path) {
+            Some(node) => self.set_focus(node, cx),
             None => self.set_focus(tree, cx),
         }
     }
@@ -1093,8 +1093,10 @@ impl DiskApp {
         };
         let hub_caption = if chart.rings <= 1 && chart.slices.is_empty() {
             "empty folder".to_string()
+        } else if chart.rings == 1 {
+            format!("{} · 1 ring", self.metric.unit())
         } else {
-            format!("{} · {}", self.metric.unit(), format!("{} rings", chart.rings))
+            format!("{} · {} rings", self.metric.unit(), chart.rings)
         };
 
         let side_px = side;
@@ -2369,6 +2371,57 @@ impl Delta {
     }
 }
 
+/// The node one ring above `path` — the tree's own parent link, which is what
+/// "Up" means on the chart.
+///
+/// `to_dto` folds a chain of single-child folders into one node (`a/b/c`), so
+/// path arithmetic would land on a prefix that the tree happens to expose as
+/// some unrelated node (the file `app.asar.unpacked` next to the folded
+/// `app.asar.unpacked/dsh/node_modules`). Walking the children instead always
+/// yields the ring the user is looking at.
+fn parent_of(tree: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
+    for child in &tree.children {
+        if child.path.eq_ignore_ascii_case(path) {
+            return Some(tree.clone());
+        }
+        if is_inside(&child.path, path) {
+            if let Some(found) = parent_of(child, path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// The deepest tree node that lives *below* `path`, used when a breadcrumb
+/// segment names the middle of a folded chain and no node carries that exact
+/// path.
+fn deepest_inside(node: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
+    let mut deepest: Option<Arc<Node>> = None;
+    for child in &node.children {
+        if is_inside(&child.path, path) {
+            // The segment is deeper than this child: keep walking down to it.
+            if let Some(found) = deepest_inside(child, path) {
+                keep_deeper(&mut deepest, found);
+            }
+        } else if is_inside(path, &child.path) {
+            // The child (or something under it) is the chain below the segment.
+            let found = deepest_inside(child, path).unwrap_or_else(|| child.clone());
+            keep_deeper(&mut deepest, found);
+        }
+    }
+    deepest
+}
+
+fn keep_deeper(best: &mut Option<Arc<Node>>, candidate: Arc<Node>) {
+    if best
+        .as_ref()
+        .is_none_or(|current| candidate.path.len() > current.path.len())
+    {
+        *best = Some(candidate);
+    }
+}
+
 /// True when `child` sits somewhere below `parent` (`C:\` contains `C:\Users`).
 fn is_inside(parent: &str, child: &str) -> bool {
     if parent.len() >= child.len() {
@@ -2642,6 +2695,60 @@ mod tests {
             kind: Kind::Dir,
             children,
         })
+    }
+
+    #[test]
+    fn climbs_past_folded_chain_nodes_to_the_nearest_real_ancestor() {
+        // The scanner folds `app.asar.unpacked\dsh\node_modules` into one node,
+        // and the same prefix also exists as a small file beside it, so path
+        // arithmetic resolves to the wrong node. "Up" must follow the rings.
+        let chain = folder(
+            r"app.asar.unpacked\dsh\node_modules",
+            r"C:\App\resources\app.asar.unpacked\dsh\node_modules",
+            300,
+            Vec::new(),
+        );
+        let loose_file = Arc::new(Node {
+            name: "app.asar.unpacked".to_string(),
+            path: r"C:\App\resources\app.asar.unpacked".to_string(),
+            size: 1,
+            files: 1,
+            dirs: 0,
+            kind: Kind::File,
+            children: Vec::new(),
+        });
+        let resources = folder(
+            "resources",
+            r"C:\App\resources",
+            400,
+            vec![chain.clone(), loose_file],
+        );
+        let app = folder("App", r"C:\App", 500, vec![resources.clone()]);
+        let root = folder("C:\\", r"C:\", 500, vec![app.clone()]);
+
+        assert_eq!(
+            parent_of(&root, &chain.path).expect("a ring above the chain").path,
+            r"C:\App\resources"
+        );
+        assert_eq!(
+            parent_of(&root, &resources.path).expect("a ring above resources").path,
+            r"C:\App"
+        );
+        assert_eq!(
+            parent_of(&root, &app.path).expect("a ring above App").path,
+            r"C:\"
+        );
+        assert!(parent_of(&root, &root.path).is_none());
+
+        // A breadcrumb segment pointing at the middle of the chain still lands
+        // on the deepest node that lives under it.
+        assert_eq!(
+            deepest_inside(&root, r"C:\App\resources\app.asar.unpacked")
+                .expect("the chain below the segment")
+                .path,
+            chain.path
+        );
+        assert!(deepest_inside(&root, &chain.path).is_none());
     }
 
     #[test]
