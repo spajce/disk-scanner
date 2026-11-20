@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Build the desktop app
+        run: cargo build --release --locked --bin disk-scanner
+
+      - name: Stage the release files
+        shell: pwsh
+        run: |
+          $tag = "${{ inputs.tag || github.ref_name }}"
+          $stage = "stage/disk-scanner-$tag-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target/release/disk-scanner.exe $stage/
+          Copy-Item README.md $stage/
+          Compress-Archive -Path "$stage/*" -DestinationPath "disk-scanner-$tag-windows-x64.zip"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Disk Scanner ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          body: |
+            Native Windows disk-usage explorer: sunburst rings, treemap and heatmap over the
+            same scanned volume.
+
+            **Download `disk-scanner-*-windows-x64.zip`, unpack it and run `disk-scanner.exe`.**
+            No installer and no runtime to download; the only requirement is the Microsoft
+            Visual C++ Redistributable (already present on virtually every Windows install).
+
+            Built from source by GitHub Actions on `windows-latest` with the release profile
+            (`lto`, `opt-level = "s"`, stripped).
+          files: |
+            disk-scanner-*-windows-x64.zip
+            target/release/disk-scanner.exe
+          fail_on_unmatched_files: true
