@@ -71,6 +71,12 @@ const MENU_H: f32 = MENU_PAD * 2.0 + MENU_HEADER_H + 1.0 + MENU_ROW_H + MENU_SEP
 const MENU_REVEAL_TOP: f32 = MENU_PAD + MENU_HEADER_H + 1.0;
 const MENU_DELETE_TOP: f32 = MENU_REVEAL_TOP + MENU_ROW_H + MENU_SEP_H;
 
+// The volume list under the select: a compact card, one row per drive.
+const COMBO_W: f32 = 300.0;
+const COMBO_PAD: f32 = 6.0;
+const COMBO_HEADER_H: f32 = 24.0;
+const COMBO_ROW_H: f32 = 44.0;
+
 fn menu_row_at(menu: &Menu, x: f32, y: f32) -> Option<usize> {
     if x < menu.x || x > menu.x + MENU_W || y < menu.y || y > menu.y + MENU_H {
         return None;
@@ -135,10 +141,15 @@ pub struct DiskApp {
     view: View,
     /// Canvas size the current tile labels were laid out for.
     tile_size: (f32, f32),
-    /// The volume picker: a select in the top bar with an in-flow list below it
-    /// (GPUI popups paint but never receive presses, so the options open as a
-    /// real row of the layout).
+    /// The volume picker: a select in the top bar, with its list painted under
+    /// it by the chart canvas (GPUI popups paint but never receive presses).
     drives_open: bool,
+    /// Row under the pointer inside the open volume list.
+    combo_hover: Option<usize>,
+    /// Client rectangle of the select, measured by a canvas in each frame.
+    select_rect: Arc<Mutex<(f32, f32, f32, f32)>>,
+    /// Logical window size from the last frame, for clamping the list.
+    viewport: (f32, f32),
 }
 
 impl DiskApp {
@@ -185,6 +196,9 @@ impl DiskApp {
             view: initial_view(),
             tile_size: (-1.0, -1.0),
             drives_open: false,
+            combo_hover: None,
+            select_rect: Arc::new(Mutex::new((0.0, 0.0, 0.0, 0.0))),
+            viewport: (1320.0, 880.0),
         };
 
         // Follow the OS while the skin is on "Auto": the registry value changes
@@ -812,9 +826,11 @@ impl DiskApp {
             })
             .unwrap_or_default();
         let fraction = active.map(usage_fraction).unwrap_or(0.0);
+        let measured = self.select_rect.clone();
 
         div()
             .id("drive-select")
+            .relative()
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -831,10 +847,29 @@ impl DiskApp {
             .border_color(if open { theme::accent() } else { theme::hairline() })
             .cursor_pointer()
             .hover(|style| style.bg(theme::surface_alt()))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.drives_open = !this.drives_open;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_drives(cx)))
+            // A one-pixel canvas is the only reliable way to learn where the
+            // select landed: element bounds are not exposed to the view.
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        if let Ok(mut slot) = measured.lock() {
+                            *slot = (
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.origin.y),
+                                f32::from(bounds.size.width),
+                                f32::from(bounds.size.height),
+                            );
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .w_full()
+                .h_full(),
+            )
             .child(
                 div()
                     .flex()
@@ -883,116 +918,172 @@ impl DiskApp {
             )
     }
 
-    /// The open list of volumes. It is a real row of the layout rather than a
-    /// floating popup: popup layers in GPUI 0.2.2 paint but never receive
-    /// presses, so a dropdown would look right and be dead to the mouse.
-    fn drives_panel(&self, cx: &mut Context<Self>) -> Div {
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (index, drive) in self.drives.iter().enumerate() {
-            let active = drive.root.eq_ignore_ascii_case(&self.last_root);
-            let fraction = usage_fraction(drive);
-            let root = drive.root.clone();
-            let title = drive_title(drive);
-            rows.push(
-                div()
-                    .id(SharedString::from(format!("drive-option-{index}")))
-                    .flex()
-                    .items_center()
-                    .gap(px(10.0))
-                    .px(px(10.0))
-                    .py(px(7.0))
-                    .rounded(px(7.0))
-                    .cursor_pointer()
-                    .bg(if active {
-                        theme::accent_soft()
-                    } else {
-                        theme::surface()
-                    })
-                    .hover(|style| style.bg(theme::surface_alt()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.drives_open = false;
-                        // Picking the volume that is already open just closes
-                        // the list; a cached volume paints from memory.
-                        if !this.last_root.eq_ignore_ascii_case(&root) {
-                            this.switch_to(root.clone(), cx);
-                        }
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .w(px(14.0))
-                            .text_size(px(10.0))
-                            .text_color(theme::accent())
-                            .child(if active { "●" } else { "" }),
-                    )
-                    .child(
-                        div()
-                            .w(px(196.0))
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(10.5))
-                            .text_color(theme::text_faint())
-                            .child(format!(
-                                "{} free of {}",
-                                theme::format_bytes(drive.free),
-                                theme::format_bytes(drive.total)
-                            )),
-                    )
-                    .child(
-                        div()
-                            .h(px(3.0))
-                            .w(px(120.0))
-                            .rounded_full()
-                            .bg(theme::track())
-                            .child(
-                                div()
-                                    .h_full()
-                                    .rounded_full()
-                                    .bg(if fraction > 0.9 {
-                                        theme::danger()
-                                    } else {
-                                        theme::accent()
-                                    })
-                                    .w(px(120.0 * fraction)),
-                            ),
-                    )
-                    .into_any_element(),
-            );
-        }
-
-        div()
-            .px(px(PAD))
-            .pb(px(8.0))
-            .pt(px(2.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .p(px(6.0))
-                    .rounded(px(11.0))
-                    .bg(theme::surface())
-                    .border_1()
-                    .border_color(theme::hairline())
-                    .child(
-                        div()
-                            .px(px(8.0))
-                            .pb(px(3.0))
-                            .text_size(px(9.5))
-                            .text_color(theme::text_faint())
-                            .child(format!("VOLUMES · {} · click to open", self.drives.len())),
-                    )
-                    .children(rows),
-            )
+    /// Where the volume list sits: directly under the select, in client pixels.
+    fn combo_rect(&self) -> (f32, f32, f32, f32) {
+        let (viewport_w, _) = self.viewport;
+        let (x, y, w, h) = self
+            .select_rect
+            .lock()
+            .map(|rect| *rect)
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        // Before the first frame measures the select, park the card on the
+        // right of the bar so it is never drawn somewhere absurd.
+        let (x, y, w, h) = if h > 0.0 {
+            (x, y, w, h)
+        } else {
+            ((viewport_w - 340.0).max(10.0), 10.0, 258.0, 44.0)
+        };
+        // The measuring canvas sits inside the select's padding box, so put the
+        // border (1 px) and padding (10 x 6) back to get the outer box.
+        let (x, y, w, h) = (x - 11.0, y - 7.0, w + 22.0, h + 14.0);
+        // The card hangs under the select, right edges flush: the select sits
+        // at the right end of the bar, so the card grows leftwards from it.
+        let left = (x + w - COMBO_W)
+            .min((viewport_w - COMBO_W - 10.0).max(10.0))
+            .max(10.0);
+        let height = COMBO_PAD * 2.0 + COMBO_HEADER_H + self.drives.len() as f32 * COMBO_ROW_H;
+        (left, y + h + 4.0, COMBO_W, height)
     }
+
+    fn combo_contains(&self, x: f32, y: f32) -> bool {
+        let (left, top, width, height) = self.combo_rect();
+        x >= left && x <= left + width && y >= top && y <= top + height
+    }
+
+    /// Everything the chart canvas needs to paint the open volume list.
+    fn combo_snapshot(
+        &self,
+    ) -> Option<(Vec<DriveInfo>, String, Option<usize>, (f32, f32, f32, f32))> {
+        if !self.drives_open {
+            return None;
+        }
+        Some((
+            self.drives.clone(),
+            self.last_root.clone(),
+            self.combo_hover,
+            self.combo_rect(),
+        ))
+    }
+
+    /// Row under a client-space point, if the point is over one.
+    fn combo_row_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (left, top, width, _) = self.combo_rect();
+        if x < left || x > left + width {
+            return None;
+        }
+        for index in 0..self.drives.len() {
+            let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
+            if y >= row_top && y < row_top + COMBO_ROW_H {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn toggle_drives(&mut self, cx: &mut Context<Self>) {
+        self.drives_open = !self.drives_open;
+        self.combo_hover = None;
+        if self.drives_open {
+            self.menu = None;
+            self.menu_hover = None;
+            self.hover = None;
+            self.tooltip = None;
+        }
+        cx.notify();
+    }
+
+    fn on_combo_move(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let hover = self.combo_row_at(x, y);
+        if hover != self.combo_hover {
+            self.combo_hover = hover;
+            cx.notify();
+        }
+    }
+
+    fn on_combo_click(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if self.combo_contains(x, y) {
+            if let Some(index) = self.combo_row_at(x, y) {
+                self.drives_open = false;
+                self.combo_hover = None;
+                if let Some(drive) = self.drives.get(index) {
+                    let root = drive.root.clone();
+                    if !self.last_root.eq_ignore_ascii_case(&root) {
+                        self.switch_to(root, cx);
+                    }
+                }
+                cx.notify();
+            }
+            return;
+        }
+        // Anywhere else dismisses the list without touching the chart.
+        self.drives_open = false;
+        self.combo_hover = None;
+        cx.notify();
+    }
+
+    /// Text for the open volume list. The card itself is painted by the chart
+    /// canvas (canvas paint uses client coordinates), so only the glyphs are
+    /// real elements.
+    fn combo_labels(&self) -> Vec<AnyElement> {
+        let (left, top, width, _) = self.combo_rect();
+        let mut out: Vec<AnyElement> = Vec::new();
+        out.push(combo_label(
+            left + 12.0 - PAD,
+            top + 7.0 - TOPBAR_H,
+            width - 24.0,
+            format!("VOLUMES · {}", self.drives.len()),
+            theme::text_faint(),
+            9.5,
+            FontWeight::NORMAL,
+            false,
+        ));
+        for (index, drive) in self.drives.iter().enumerate() {
+            let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
+            let active = drive.root.eq_ignore_ascii_case(&self.last_root);
+            out.push(combo_label(
+                left + 18.0 - PAD,
+                row_top + 6.5 - TOPBAR_H,
+                44.0,
+                drive.root.trim_end_matches('\\').to_string(),
+                theme::text(),
+                12.0,
+                FontWeight::SEMIBOLD,
+                false,
+            ));
+            if !drive.label.is_empty() {
+                out.push(combo_label(
+                    left + 58.0 - PAD,
+                    row_top + 8.0 - TOPBAR_H,
+                    120.0,
+                    drive.label.clone(),
+                    if active {
+                        theme::text_dim()
+                    } else {
+                        theme::text_faint()
+                    },
+                    10.5,
+                    FontWeight::NORMAL,
+                    false,
+                ));
+            }
+            out.push(combo_label(
+                left + width - 190.0 - PAD,
+                row_top + 8.0 - TOPBAR_H,
+                176.0,
+                format!(
+                    "{} free of {}",
+                    theme::format_bytes(drive.free),
+                    theme::format_bytes(drive.total)
+                ),
+                theme::text_faint(),
+                10.0,
+                FontWeight::NORMAL,
+                true,
+            ));
+        }
+        out
+    }
+
 
     fn view_button(&self, view: View, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let active = self.view == view;
@@ -1273,6 +1364,11 @@ impl DiskApp {
             format!("{} · {} rings", self.metric.unit(), chart.rings)
         };
 
+        // The volume list is painted by the canvas, so text labels would sit on
+        // top of it; hide them while the list is open.
+        if self.drives_open {
+            labels.clear();
+        }
         let side_px = side;
         let rings = chart.rings;
         let store_prepaint = placed.clone();
@@ -1280,6 +1376,7 @@ impl DiskApp {
         let store_paint = placed.clone();
         let menu_paint = self.menu.clone();
         let menu_hover = self.menu_hover;
+        let combo_paint = self.combo_snapshot();
         let mut area = div()
             .relative()
             .flex_1()
@@ -1313,6 +1410,16 @@ impl DiskApp {
                                 paint_sunburst(window, origin, &geom, &chart_paint, hover, &chain);
                                 if let Some(menu) = &menu_paint {
                                     paint_menu(window, origin, menu, menu_hover);
+                                }
+                                if let Some(combo) = &combo_paint {
+                                    paint_combo(
+                                        window,
+                                        &combo.0,
+                                        &combo.1,
+                                        combo.2,
+                                        combo.3 .0,
+                                        combo.3 .1,
+                                    );
                                 }
                             },
                         )
@@ -1348,23 +1455,29 @@ impl DiskApp {
                                     .text_color(theme::text_faint())
                                     .child(hub_caption),
                             ),
-                    )
-                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
-                        this.on_chart_move(event, cx);
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.on_chart_click(event, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                            this.on_chart_right_click(event, window, cx);
-                        }),
                     ),
+            )
+            // The handlers live on the whole column, not just the square: the
+            // volume list hangs below the top bar and must swallow its clicks
+            // even where it reaches past the chart.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.on_chart_move(event, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    this.on_chart_click(event, cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.on_chart_right_click(event, window, cx);
+                }),
             );
+        if self.drives_open {
+            area = area.children(self.combo_labels());
+        }
         // While a *different* volume is being walked, the chart on screen is
         // yesterday's news: veil it so nobody reads C: numbers as G: numbers.
         if scanning && !chart.focus.path.eq_ignore_ascii_case(&self.last_root) {
@@ -1472,12 +1585,18 @@ impl DiskApp {
         }
 
 
+        if self.drives_open {
+            labels.clear();
+            labels.extend(self.combo_labels());
+        }
+
         let chart_prepaint = chart.clone();
         let chart_paint = chart.clone();
         let store_prepaint = self.placed.clone();
         let paint_chain = chain.clone();
         let menu_paint_tiles = self.menu.clone();
         let menu_hover_tiles = self.menu_hover;
+        let combo_paint_tiles = self.combo_snapshot();
 
         if let Some(menu) = &self.menu {
             let origin = self
@@ -1550,6 +1669,16 @@ impl DiskApp {
                             );
                             if let Some(menu) = &menu_paint_tiles {
                                 paint_menu(window, bounds.origin, menu, menu_hover_tiles);
+                            }
+                            if let Some(combo) = &combo_paint_tiles {
+                                paint_combo(
+                                    window,
+                                    &combo.0,
+                                    &combo.1,
+                                    combo.2,
+                                    combo.3 .0,
+                                    combo.3 .1,
+                                );
                             }
                         },
                     )
@@ -1702,6 +1831,15 @@ impl DiskApp {
     }
 
     fn on_chart_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // An open volume list owns the pointer, exactly like the menu does.
+        if self.drives_open {
+            self.on_combo_move(
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                cx,
+            );
+            return;
+        }
         // The menu takes over the pointer: rows light up, the chart stops
         // tracking hover so its tooltip does not fight the menu for space.
         if let Some(menu) = &self.menu {
@@ -1727,6 +1865,16 @@ impl DiskApp {
     }
 
     fn on_chart_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        // A press on the open volume list picks a volume or dismisses the list;
+        // either way it never reaches the chart behind it.
+        if self.drives_open {
+            self.on_combo_click(
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+                cx,
+            );
+            return;
+        }
         // A press on an open menu resolves against its rows; a press anywhere
         // else dismisses it. Either way the chart underneath stays put.
         if let Some(menu) = self.menu.clone() {
@@ -1786,6 +1934,13 @@ impl DiskApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A right press on the open volume list just dismisses it.
+        if self.drives_open {
+            self.drives_open = false;
+            self.combo_hover = None;
+            cx.notify();
+            return;
+        }
         // A right press on an open menu just dismisses it.
         if let Some(menu) = self.menu.clone() {
             self.menu = None;
@@ -2241,14 +2396,18 @@ impl DiskApp {
                                 .text_size(px(10.5))
                                 .text_color(theme::text_dim())
                                 .child(format!(
-                                    "{} · {} of {} · {} files",
+                                    "{} · {} of {} · {}",
                                     theme::format_bytes(node.size),
                                     theme::format_percent(share),
                                     match chart.metric {
                                         Metric::Bytes => "folder",
                                         Metric::Files => "parent",
                                     },
-                                    theme::format_count(node.files)
+                                    if node.files == 1 {
+                                        "1 file".to_string()
+                                    } else {
+                                        format!("{} files", theme::format_count(node.files))
+                                    }
                                 )),
                         )
                         .into_any_element(),
@@ -2397,7 +2556,140 @@ fn menu_label(
         .into_any_element()
 }
 
-fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {    let mut set = HashSet::new();
+/// Paint the open volume list: a compact card with the header rule, the active
+/// row marker and one usage bar per drive. Client coordinates, like the menu.
+fn paint_combo(
+    window: &mut Window,
+    drives: &[DriveInfo],
+    active_root: &str,
+    hover: Option<usize>,
+    left: f32,
+    top: f32,
+) {
+    let height = COMBO_PAD * 2.0 + COMBO_HEADER_H + drives.len() as f32 * COMBO_ROW_H;
+    let card = Bounds {
+        origin: point(px(left), px(top)),
+        size: size(px(COMBO_W), px(height)),
+    };
+    window.paint_quad(quad(
+        card,
+        px(10.0),
+        theme::surface_alt(),
+        px(1.0),
+        theme::hairline(),
+        BorderStyle::Solid,
+    ));
+
+    let rule = Bounds {
+        origin: point(px(left + 10.0), px(top + COMBO_PAD + COMBO_HEADER_H)),
+        size: size(px(COMBO_W - 20.0), px(1.0)),
+    };
+    window.paint_quad(quad(
+        rule,
+        px(0.0),
+        theme::hairline(),
+        px(0.0),
+        theme::hairline(),
+        BorderStyle::Solid,
+    ));
+
+    for (index, drive) in drives.iter().enumerate() {
+        let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
+        let active = drive.root.eq_ignore_ascii_case(active_root);
+        if active || hover == Some(index) {
+            let row = Bounds {
+                origin: point(px(left + 4.0), px(row_top + 1.0)),
+                size: size(px(COMBO_W - 8.0), px(COMBO_ROW_H - 2.0)),
+            };
+            window.paint_quad(quad(
+                row,
+                px(7.0),
+                theme::accent_soft(),
+                px(0.0),
+                theme::accent_soft(),
+                BorderStyle::Solid,
+            ));
+        }
+        if active {
+            let mark = Bounds {
+                origin: point(px(left + 6.0), px(row_top + 10.0)),
+                size: size(px(2.5), px(COMBO_ROW_H - 20.0)),
+            };
+            window.paint_quad(quad(
+                mark,
+                px(1.0),
+                theme::accent(),
+                px(0.0),
+                theme::accent(),
+                BorderStyle::Solid,
+            ));
+        }
+
+        let fraction = usage_fraction(drive);
+        let bar_top = row_top + COMBO_ROW_H - 12.0;
+        let track = Bounds {
+            origin: point(px(left + 18.0), px(bar_top)),
+            size: size(px(COMBO_W - 36.0), px(3.0)),
+        };
+        window.paint_quad(quad(
+            track,
+            px(1.5),
+            theme::track(),
+            px(0.0),
+            theme::track(),
+            BorderStyle::Solid,
+        ));
+        if fraction > 0.0 {
+            let fill = Bounds {
+                origin: point(px(left + 18.0), px(bar_top)),
+                size: size(px((COMBO_W - 36.0) * fraction), px(3.0)),
+            };
+            let color = if fraction > 0.9 {
+                theme::danger()
+            } else {
+                theme::accent()
+            };
+            window.paint_quad(quad(fill, px(1.5), color, px(0.0), color, BorderStyle::Solid));
+        }
+    }
+}
+
+/// One line of text for the painted volume list, positioned inside the chart
+/// column (which is the chart canvas' coordinate origin for children).
+fn combo_label(
+    x: f32,
+    y: f32,
+    width: f32,
+    text: String,
+    color: gpui::Rgba,
+    size: f32,
+    weight: FontWeight,
+    right: bool,
+) -> AnyElement {
+    let mut label = div()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(width))
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .truncate()
+        .text_size(px(size))
+        .text_color(color)
+        .font_weight(weight);
+    if right {
+        label = label.text_right();
+    }
+    label.child(text).into_any_element()
+}
+
+fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {
+    let mut set = HashSet::new();
+    // A hover index from the previous chart (before a volume or folder switch)
+    // can point past the new slice list; drop it instead of panicking.
+    if index >= chart.slices.len() {
+        return set;
+    }
     let mut current = index;
     loop {
         set.insert(current);
@@ -2843,6 +3135,19 @@ impl Render for DiskApp {
         let viewport = window.viewport_size();
         let viewport_w = f32::from(viewport.width);
         let viewport_h = f32::from(viewport.height);
+        // The volume list is painted by the chart canvas, which needs to know
+        // where it must stop before it runs off the window.
+        self.viewport = (viewport_w, viewport_h);
+        // Switching volumes or folders swaps the chart under the pointer; a
+        // hover index from the old chart must not survive into the new one.
+        if let Some(chart) = &self.chart {
+            if self.hover.is_some_and(|index| index >= chart.slices.len()) {
+                self.hover = None;
+                self.tooltip = None;
+                self.menu = None;
+                self.menu_hover = None;
+            }
+        }
         if !self.focus_handle.is_focused(window) {
             window.focus(&self.focus_handle);
         }
@@ -2860,11 +3165,6 @@ impl Render for DiskApp {
             .font_family("Segoe UI")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
             .child(self.top_bar(cx));
-
-        // The volume list opens as a row of the layout, right under the select.
-        if self.drives_open {
-            root = root.child(self.drives_panel(cx));
-        }
 
         root = root
             .child(
