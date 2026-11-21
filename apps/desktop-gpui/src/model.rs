@@ -123,6 +123,9 @@ pub enum View {
     Rings,
     Treemap,
     Heatmap,
+    /// The Explorer-style details table: one row per direct child with its
+    /// size, counts, status, modification date and type.
+    Details,
 }
 
 impl View {
@@ -131,6 +134,7 @@ impl View {
             View::Rings => "Rings",
             View::Treemap => "Treemap",
             View::Heatmap => "Heatmap",
+            View::Details => "Details",
         }
     }
 
@@ -139,6 +143,7 @@ impl View {
             View::Rings => "rings",
             View::Treemap => "treemap",
             View::Heatmap => "heatmap",
+            View::Details => "details",
         }
     }
 
@@ -147,6 +152,7 @@ impl View {
             "rings" | "sunburst" => Some(View::Rings),
             "treemap" | "tree" => Some(View::Treemap),
             "heatmap" | "heat" => Some(View::Heatmap),
+            "details" | "list" | "table" => Some(View::Details),
             _ => None,
         }
     }

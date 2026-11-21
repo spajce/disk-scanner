@@ -302,19 +302,23 @@ fn list_dir(dir: &Path) -> Option<Listing> {    use windows_sys::Win32::Foundati
                 // on the disk than their logical length; ask the volume for the
                 // allocated size of just those, which are rare enough to keep
                 // the extra syscall off the hot path.
-                if attributes & TIGHTLY_PACKED_ATTRIBUTES != 0 {
+                let packed = attributes & TIGHTLY_PACKED_ATTRIBUTES != 0;
+                // Only two kinds of entry keep a path — the packed ones, which
+                // the volume call needs, and the ones big enough to be drawn —
+                // and the buffer is rebuilt for each of them. Leaving a stale
+                // path in place would pair this file's size with the previous
+                // *directory*'s name.
+                if packed || size >= FILE_FLOOR {
                     joined.clear();
                     joined.push(dir);
                     joined.push(OsString::from_wide(name));
-                    size = allocated_size(&joined, size);
+                    if packed {
+                        size = allocated_size(&joined, size);
+                    }
                 }
                 listing.files_seen += 1;
                 listing.bytes += size;
                 if size >= FILE_FLOOR {
-                    if joined.as_os_str().is_empty() {
-                        joined.push(dir);
-                        joined.push(OsString::from_wide(name));
-                    }
                     listing.files.push((size, joined.clone()));
                 }
                 joined.clear();
@@ -732,6 +736,30 @@ mod tests {
         let dto = to_dto(&raw, raw.size);
         let sum: u64 = dto.children.iter().map(|child| child.size).sum();
         assert_eq!(sum, dto.size, "arcs must add up to the folder total");
+    }
+
+    #[test]
+    fn drawn_files_keep_their_own_name() {
+        let tree = TempTree::new("names");
+        // A subdirectory is walked first, so the reusable path buffer is
+        // holding its name when the big file below is visited.
+        tree.file("folder/inner.bin", 512);
+        tree.file("payload.bin", FILE_FLOOR as usize);
+
+        let raw = scan_tree(&tree.0);
+        for child in &raw.children {
+            let last = child.path.rsplit('\\').next().unwrap_or_default();
+            assert_eq!(
+                child.name, last,
+                "a node's name must come from its own path, not a neighbour's"
+            );
+        }
+        assert!(
+            raw.children
+                .iter()
+                .any(|child| !child.is_dir && child.name == "payload.bin"),
+            "the file big enough to draw keeps its own name"
+        );
     }
 
     #[test]

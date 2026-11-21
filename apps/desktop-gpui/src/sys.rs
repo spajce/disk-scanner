@@ -62,6 +62,69 @@ pub fn active_window() -> isize {
     unsafe { GetActiveWindow() as isize }
 }
 
+/// `Date modified` for one path, as Explorer prints it: the local clock in
+/// 12-hour form (`3/26/2025 10:49 pm`), together with the raw timestamp so the
+/// list can sort on the real value instead of the text.
+///
+/// Both halves are read on a worker thread; a path that vanished since the scan
+/// simply has no date.
+pub fn modified(path: &str) -> Option<(std::time::SystemTime, String)> {
+    let stamp = std::fs::metadata(path).ok()?.modified().ok()?;
+    let label = format_local(stamp)?;
+    Some((stamp, label))
+}
+
+/// UTC → the machine's current time zone, then month/day/year and a 12-hour
+/// clock. `SYSTEMTIME`/`TzSpecificLocalTime` are used rather than arithmetic
+/// because they follow the zone (and its daylight-saving rules) Windows has
+/// configured for the user.
+fn format_local(stamp: std::time::SystemTime) -> Option<String> {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+
+    let since = stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    // 100 ns ticks between 1601-01-01 (FILETIME epoch) and 1970-01-01.
+    let ticks =
+        (since.as_secs() + 11_644_473_600) * 10_000_000 + u64::from(since.subsec_nanos()) / 100;
+    let file_time = FILETIME {
+        dwLowDateTime: ticks as u32,
+        dwHighDateTime: (ticks >> 32) as u32,
+    };
+    let empty = SYSTEMTIME {
+        wYear: 0,
+        wMonth: 0,
+        wDayOfWeek: 0,
+        wDay: 0,
+        wHour: 0,
+        wMinute: 0,
+        wSecond: 0,
+        wMilliseconds: 0,
+    };
+    let (mut utc, mut local) = (empty, empty);
+    // SAFETY: both structures are stack values that outlive the calls, and a
+    // null time-zone pointer means "the current zone".
+    unsafe {
+        if FileTimeToSystemTime(&file_time, &mut utc) == 0 {
+            return None;
+        }
+        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) == 0 {
+            return None;
+        }
+    }
+
+    let hour = match local.wHour % 12 {
+        0 => 12,
+        other => other,
+    };
+    let suffix = if local.wHour < 12 { "am" } else { "pm" };
+    Some(format!(
+        "{}/{}/{} {}:{:02} {}",
+        local.wMonth, local.wDay, local.wYear, hour, local.wMinute, suffix
+    ))
+}
+
 static ICON_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
 unsafe extern "system" fn find_own_window(

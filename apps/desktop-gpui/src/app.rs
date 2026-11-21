@@ -5,7 +5,7 @@ use std::f32::consts::TAU;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use gpui::prelude::*;
 use gpui::{
@@ -91,11 +91,23 @@ const MENU_H: f32 = MENU_PAD * 2.0 + MENU_HEADER_H + 1.0 + MENU_ROW_H + MENU_SEP
 const MENU_REVEAL_TOP: f32 = MENU_PAD + MENU_HEADER_H + 1.0;
 const MENU_DELETE_TOP: f32 = MENU_REVEAL_TOP + MENU_ROW_H + MENU_SEP_H;
 
-// The volume list under the select: a compact card, one row per drive.
-const COMBO_W: f32 = 300.0;
-const COMBO_PAD: f32 = 6.0;
-const COMBO_HEADER_H: f32 = 24.0;
-const COMBO_ROW_H: f32 = 44.0;
+// The details view: an Explorer-style table of the open folder's children. The
+// columns are fixed widths so the header and every row line up without a real
+// table layout, and the name column takes whatever is left.
+const DETAIL_ROW_H: f32 = 23.0;
+const DETAIL_HEADER_H: f32 = 26.0;
+// The navigation pane shared by every view: the volumes, then the open
+// folder's chain. `NAV_W` is its width, gap included, when a view reserves room
+// for it.
+const NAV_W: f32 = 226.0;
+const COL_SIZE: f32 = 92.0;
+const COL_FILES: f32 = 70.0;
+const COL_FOLDERS: f32 = 70.0;
+const COL_STATUS: f32 = 66.0;
+const COL_MODIFIED: f32 = 138.0;
+const COL_TYPE: f32 = 136.0;
+/// Two presses on the same row inside this window open it, like Explorer.
+const DETAIL_DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
 fn menu_row_at(menu: &Menu, x: f32, y: f32) -> Option<usize> {
     if x < menu.x || x > menu.x + MENU_W || y < menu.y || y > menu.y + MENU_H {
@@ -113,6 +125,42 @@ fn menu_row_at(menu: &Menu, x: f32, y: f32) -> Option<usize> {
 
 fn menu_contains(menu: &Menu, x: f32, y: f32) -> bool {
     x >= menu.x && x <= menu.x + MENU_W && y >= menu.y && y <= menu.y + MENU_H
+}
+
+/// Sortable columns of the details view.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DetailKey {
+    Name,
+    Size,
+    Files,
+    Folders,
+    Status,
+    Modified,
+    Type,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct DetailSort {
+    key: DetailKey,
+    ascending: bool,
+}
+
+impl Default for DetailSort {
+    fn default() -> Self {
+        // Biggest first, which is the question this app exists to answer.
+        Self {
+            key: DetailKey::Size,
+            ascending: false,
+        }
+    }
+}
+
+/// What the filesystem says about one row: the modification time as a value
+/// (for sorting) and already formatted (for painting).
+#[derive(Clone, Debug)]
+struct DetailMeta {
+    stamp: Option<SystemTime>,
+    label: Option<String>,
 }
 
 struct Placed {
@@ -181,15 +229,19 @@ pub struct DiskApp {
     view: View,
     /// Canvas size the current tile labels were laid out for.
     tile_size: (f32, f32),
-    /// The volume picker: a select in the top bar, with its list painted under
-    /// it by the chart canvas (GPUI popups paint but never receive presses).
-    drives_open: bool,
-    /// Row under the pointer inside the open volume list.
-    combo_hover: Option<usize>,
-    /// Client rectangle of the select, measured by a canvas in each frame.
-    select_rect: Arc<Mutex<(f32, f32, f32, f32)>>,
-    /// Logical window size from the last frame, for clamping the list.
+    /// Logical window size from the last frame, for clamping overlays.
     viewport: (f32, f32),
+    /// Details view: the column the table is sorted by.
+    detail_sort: DetailSort,
+    /// Details view: the selected row, and when it was last pressed, so a
+    /// second press inside the double-click window opens the folder.
+    detail_selected: Option<String>,
+    detail_clicked: Option<(String, Instant)>,
+    /// Modification dates for the rows on screen, collected on a worker thread.
+    detail_meta: Arc<Mutex<HashMap<String, DetailMeta>>>,
+    /// Folder whose dates have already been requested, so a frame never starts
+    /// the same walk twice.
+    detail_meta_for: Option<String>,
 }
 
 impl DiskApp {
@@ -236,10 +288,12 @@ impl DiskApp {
             system_dark,
             view: initial_view(),
             tile_size: (-1.0, -1.0),
-            drives_open: false,
-            combo_hover: None,
-            select_rect: Arc::new(Mutex::new((0.0, 0.0, 0.0, 0.0))),
             viewport: (1320.0, 880.0),
+            detail_sort: DetailSort::default(),
+            detail_selected: None,
+            detail_clicked: None,
+            detail_meta: Arc::new(Mutex::new(HashMap::new())),
+            detail_meta_for: None,
         };
 
         // Follow the OS while the skin is on "Auto": the registry value changes
@@ -297,6 +351,8 @@ impl DiskApp {
 
     fn set_focus(&mut self, node: Arc<Node>, cx: &mut Context<Self>) {
         self.focus_path = node.path.clone();
+        // A selection belongs to the folder it was made in.
+        self.detail_selected = None;
         self.show_chart(node);
         cx.notify();
     }
@@ -399,22 +455,21 @@ impl DiskApp {
         self.start_scan(root, cx);
     }
 
-    /// Rings, treemap or heatmap over the same tree.
+    /// Rings, treemap, heatmap or the details table over the same tree.
     fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         if self.view == view {
-            self.drives_open = false;
             cx.notify();
             return;
         }
         self.view = view;
         save_view(view);
-        self.drives_open = false;
         self.hover = None;
         self.tooltip = None;
         cx.notify();
     }
 
-    fn set_theme_mode(&mut self, mode: theme::Mode, cx: &mut Context<Self>) {        self.theme_mode = mode;
+    fn set_theme_mode(&mut self, mode: theme::Mode, cx: &mut Context<Self>) {
+        self.theme_mode = mode;
         theme::apply(mode, self.system_dark);
         save_theme_mode(mode);
         cx.notify();
@@ -791,10 +846,593 @@ impl DiskApp {
         cx.notify();
     }
 
+    // ----------------------------------------------------------- details view
+
+    fn set_detail_sort(&mut self, key: DetailKey, cx: &mut Context<Self>) {
+        if self.detail_sort.key == key {
+            self.detail_sort.ascending = !self.detail_sort.ascending;
+        } else {
+            self.detail_sort = DetailSort {
+                key,
+                ascending: matches!(key, DetailKey::Name | DetailKey::Type | DetailKey::Status),
+            };
+        }
+        cx.notify();
+    }
+
+    /// A press in the table selects the row; a second press on the same row
+    /// inside the double-click window opens it, exactly like Explorer.
+    fn detail_click(&mut self, node: Arc<Node>, cx: &mut Context<Self>) {
+        let path = node.path.clone();
+        let again = self
+            .detail_clicked
+            .as_ref()
+            .is_some_and(|(last, at)| last == &path && at.elapsed() < DETAIL_DOUBLE_CLICK);
+        self.detail_clicked = Some((path.clone(), Instant::now()));
+        self.detail_selected = Some(path);
+        if again {
+            self.detail_open(node, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// Open a table row: a folder becomes the new focus; a file, or an
+    /// aggregated row that has no path, is reported in the status bar.
+    fn detail_open(&mut self, node: Arc<Node>, cx: &mut Context<Self>) {
+        if node.is_dir() && !node.path.is_empty() {
+            self.detail_selected = None;
+            self.set_focus(node, cx);
+        } else if !node.path.is_empty() {
+            self.note = Some(format!(
+                "{} · {}",
+                node.name,
+                theme::format_bytes(node.size)
+            ));
+            cx.notify();
+        }
+    }
+
+    /// The row the toolbar buttons act on.
+    fn selected_detail_node(&self) -> Option<Arc<Node>> {
+        let path = self.detail_selected.as_ref()?;
+        let focus = self.focus()?;
+        focus
+            .children
+            .iter()
+            .find(|child| child.path.eq_ignore_ascii_case(path))
+            .cloned()
+    }
+
+    /// Ask a worker thread for the modification dates of the open folder's
+    /// children. Reading them in the render pass would stall the window on a
+    /// slow volume, so the table shows its placeholders until they arrive.
+    fn request_detail_meta(&mut self, focus: &Arc<Node>, cx: &mut Context<Self>) {
+        let key = cache_key(&focus.path);
+        if self.detail_meta_for.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.detail_meta_for = Some(key.clone());
+        let paths: Vec<String> = focus
+            .children
+            .iter()
+            .filter(|child| !child.path.is_empty())
+            .map(|child| child.path.clone())
+            .collect();
+        let store = self.detail_meta.clone();
+        cx.spawn(async move |this, cx| {
+            let dates = cx
+                .background_spawn(async move {
+                    let mut out: Vec<(String, Option<(SystemTime, String)>)> =
+                        Vec::with_capacity(paths.len());
+                    for path in paths {
+                        let date = crate::sys::modified(&path);
+                        out.push((path, date));
+                    }
+                    out
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                // The user may have moved on to another folder already.
+                if this.detail_meta_for.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                if let Ok(mut map) = store.lock() {
+                    map.clear();
+                    for (path, date) in dates {
+                        map.insert(
+                            path,
+                            DetailMeta {
+                                stamp: date.as_ref().map(|(stamp, _)| *stamp),
+                                label: date.map(|(_, label)| label),
+                            },
+                        );
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The open folder's children in the order the header asks for. Names are
+    /// lower-cased once per row instead of once per comparison.
+    fn detail_rows(
+        &self,
+        focus: &Arc<Node>,
+        meta: Option<&HashMap<String, DetailMeta>>,
+    ) -> Vec<(String, Arc<Node>)> {
+        let mut rows: Vec<(String, Arc<Node>)> = focus
+            .children
+            .iter()
+            .map(|child| (child.name.to_lowercase(), child.clone()))
+            .collect();
+        let sort = self.detail_sort;
+        rows.sort_by(|(an, a), (bn, b)| {
+            let by_name = an.cmp(bn);
+            // Sorting by name or status keeps folders above files in both
+            // directions, the way Explorer does; the column only flips the
+            // names inside each group.
+            let by_kind = (b.is_dir() as u8).cmp(&(a.is_dir() as u8));
+            let ordering = match sort.key {
+                DetailKey::Name | DetailKey::Status => {
+                    by_kind.then(if sort.ascending { by_name } else { by_name.reverse() })
+                }
+                DetailKey::Size => a.size.cmp(&b.size),
+                DetailKey::Files => a.files.cmp(&b.files),
+                DetailKey::Folders => a.dirs.cmp(&b.dirs),
+                DetailKey::Modified => {
+                    let left = meta.and_then(|map| map.get(&a.path)).and_then(|item| item.stamp);
+                    let right = meta.and_then(|map| map.get(&b.path)).and_then(|item| item.stamp);
+                    left.cmp(&right).then(by_name)
+                }
+                DetailKey::Type => type_label(a).cmp(&type_label(b)).then(by_name),
+            };
+            match sort.key {
+                DetailKey::Name | DetailKey::Status => ordering,
+                _ if sort.ascending => ordering,
+                _ => ordering.reverse(),
+            }
+        });
+        rows
+    }
+
+    /// The Explorer-style details table: one row per child of the open folder,
+    /// with the column header that drives the sort. The navigation pane beside
+    /// it is laid out by the window, so every view puts it in the same place.
+    fn details_area(&mut self, cx: &mut Context<Self>) -> Div {
+        let Some(focus) = self.focus() else {
+            return div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(self.scan_card(cx));
+        };
+        self.request_detail_meta(&focus, cx);
+
+        let dates = self.detail_meta.lock().ok();
+        let rows = self.detail_rows(&focus, dates.as_deref());
+        self.detail_table(&focus, rows, dates.as_deref(), cx)
+    }
+
+    /// The left column: the volumes, then where the open folder sits in its own
+    /// chain. Both are click targets, so the pane doubles as navigation — and it
+    /// is the same pane in every view.
+    fn detail_nav(&self, focus: &Arc<Node>, cx: &mut Context<Self>) -> Div {
+        let mut pane = div()
+            .w(px(NAV_W))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .p(px(8.0))
+            .rounded(px(10.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .text_size(px(11.5))
+            .child(section_label("THIS PC"));
+
+        let active_root = self.active_drive().map(|drive| drive.root.clone());
+        for drive in &self.drives {
+            let active = active_root
+                .as_deref()
+                .is_some_and(|root| root.eq_ignore_ascii_case(&drive.root));
+            let fraction = usage_fraction(drive);
+            let root = drive.root.clone();
+            let title = drive_title(drive);
+            let usage = format!(
+                "{} free of {}",
+                theme::format_bytes(drive.free),
+                theme::format_bytes(drive.total)
+            );
+            pane = pane.child(
+                div()
+                    .id(SharedString::from(format!("nav-{root}")))
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .px(px(7.0))
+                    .py(px(5.0))
+                    .rounded(px(7.0))
+                    .cursor_pointer()
+                    .bg(if active {
+                        theme::accent_soft()
+                    } else {
+                        theme::surface()
+                    })
+                    .hover(|style| style.bg(theme::surface_alt()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.last_root.eq_ignore_ascii_case(&root) {
+                            this.switch_to(root.clone(), cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(div().text_size(px(11.0)).child("💾"))
+                            .child(div().flex_1().min_w_0().truncate().child(title)),
+                    )
+                    .child(
+                        div()
+                            .h(px(3.0))
+                            .w_full()
+                            .rounded_full()
+                            .bg(theme::track())
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(if fraction > 0.9 {
+                                        theme::danger()
+                                    } else {
+                                        theme::accent()
+                                    })
+                                    .w(px((NAV_W - 26.0) * fraction)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(theme::text_faint())
+                            .truncate()
+                            .child(usage),
+                    ),
+            );
+        }
+
+        pane = pane.child(
+            div()
+                .mt(px(8.0))
+                .child(section_label("CURRENT FOLDER")),
+        );
+        let segments = breadcrumb_segments(&focus.path);
+        let last = segments.len().saturating_sub(1);
+        for (index, (label, full)) in segments.into_iter().enumerate() {
+            let current = index == last;
+            let target = full;
+            pane = pane.child(
+                div()
+                    .id(SharedString::from(format!("nav-crumb-{index}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .pl(px(7.0 + index as f32 * 10.0))
+                    .pr(px(6.0))
+                    .py(px(3.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_color(if current {
+                        theme::text()
+                    } else {
+                        theme::text_dim()
+                    })
+                    .font_weight(if current {
+                        FontWeight::MEDIUM
+                    } else {
+                        FontWeight::NORMAL
+                    })
+                    .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.jump_to(target.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .opacity(0.6)
+                            .child(if current { "▸" } else { "·" }),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label)),
+            );
+        }
+        pane
+    }
+
+    /// The table itself: the folder's own toolbar, the column header, the
+    /// scrollable rows and a summary line.
+    fn detail_table(
+        &self,
+        focus: &Arc<Node>,
+        rows: Vec<(String, Arc<Node>)>,
+        meta: Option<&HashMap<String, DetailMeta>>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let folders = rows.iter().filter(|(_, node)| node.is_dir()).count();
+        let files = rows.len() - folders;
+        let total: u64 = rows.iter().map(|(_, node)| node.size).sum();
+
+        let mut body = div()
+            .id("detail-rows")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
+        for (index, (_, node)) in rows.into_iter().enumerate() {
+            let selected = self
+                .detail_selected
+                .as_ref()
+                .is_some_and(|path| path.eq_ignore_ascii_case(&node.path));
+            body = body.child(self.detail_row(index, node, selected, meta, cx));
+        }
+        if focus.children.is_empty() {
+            body = body.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(14.0))
+                    .text_size(px(11.0))
+                    .text_color(theme::text_faint())
+                    .child("This folder is empty."),
+            );
+        }
+
+        div()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::hairline())
+                    .child(self.ghost_button("↑ Up", true, cx, |this, cx| this.go_up(cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.path_crumbs(&focus.path, cx)),
+                    )
+                    .child(self.action_button("↗ Reveal", cx, |this, _| {
+                        if let Some(node) = this.selected_detail_node() {
+                            crate::sys::reveal(&node.path, node.is_dir());
+                        }
+                    }))
+                    .child(self.danger_button(
+                        "🗑 Delete…",
+                        self.selected_detail_node().is_some(),
+                        cx,
+                        |this, cx| {
+                            if let Some(node) = this.selected_detail_node() {
+                                this.ask_delete(node, cx);
+                            }
+                        },
+                    )),
+            )
+            .child(self.detail_header(cx))
+            .child(body)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(10.0))
+                    .py(px(4.0))
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .text_size(px(10.0))
+                    .text_color(theme::text_faint())
+                    .child(format!(
+                        "{} · {}",
+                        count_label(folders, "folder", "folders"),
+                        count_label(files, "file", "files")
+                    ))
+                    .child(format!("{} total", theme::format_bytes(total))),
+            )
+    }
+
+    fn detail_header(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .h(px(DETAIL_HEADER_H))
+            .px(px(4.0))
+            .flex_shrink_0()
+            .bg(theme::surface_alt())
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(self.detail_header_cell("Name", DetailKey::Name, false, cx)),
+            )
+            .child(
+                self.detail_header_cell("Size", DetailKey::Size, true, cx)
+                    .w(px(COL_SIZE))
+                    .flex_shrink_0(),
+            )
+            .child(
+                self.detail_header_cell("Files", DetailKey::Files, true, cx)
+                    .w(px(COL_FILES))
+                    .flex_shrink_0(),
+            )
+            .child(
+                self.detail_header_cell("Folders", DetailKey::Folders, true, cx)
+                    .w(px(COL_FOLDERS))
+                    .flex_shrink_0(),
+            )
+            .child(
+                self.detail_header_cell("Status", DetailKey::Status, false, cx)
+                    .w(px(COL_STATUS))
+                    .flex_shrink_0(),
+            )
+            .child(
+                self.detail_header_cell("Date Modified", DetailKey::Modified, false, cx)
+                    .w(px(COL_MODIFIED))
+                    .flex_shrink_0(),
+            )
+            .child(
+                self.detail_header_cell("Type", DetailKey::Type, false, cx)
+                    .w(px(COL_TYPE))
+                    .flex_shrink_0(),
+            )
+    }
+
+    fn detail_header_cell(
+        &self,
+        label: &str,
+        key: DetailKey,
+        right: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let active = self.detail_sort.key == key;
+        let arrow = if active {
+            if self.detail_sort.ascending {
+                "▲"
+            } else {
+                "▼"
+            }
+        } else {
+            ""
+        };
+        let mut cell = div()
+            .id(SharedString::from(format!("detail-sort-{label}")))
+            .flex()
+            .items_center()
+            .gap(px(3.0))
+            .px(px(6.0))
+            .py(px(4.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_size(px(10.5))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::text_dim()
+            })
+            .hover(|style| style.bg(theme::surface()).text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_detail_sort(key, cx)))
+            .child(label.to_string());
+        if right {
+            cell = cell.justify_end();
+        }
+        cell.child(
+            div()
+                .text_size(px(7.0))
+                .text_color(theme::accent())
+                .child(arrow.to_string()),
+        )
+    }
+
+    fn detail_row(
+        &self,
+        index: usize,
+        node: Arc<Node>,
+        selected: bool,
+        meta: Option<&HashMap<String, DetailMeta>>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let click = node.clone();
+        let glyph = match node.kind {
+            Kind::Dir => "📁",
+            Kind::File => "📄",
+            Kind::Other => "⋯",
+        };
+        // An aggregated "(n more)" row has no size of its own to report.
+        let size = if node.kind == Kind::Other {
+            "—".to_string()
+        } else {
+            theme::format_bytes(node.size)
+        };
+        // Folders report the state of their walk; a file has nothing to say.
+        let status = if node.is_dir() { "OK" } else { "" };
+        let date = meta
+            .and_then(|map| map.get(&node.path))
+            .and_then(|item| item.label.clone())
+            .unwrap_or_else(|| "—".to_string());
+        let kind = type_label(&node);
+        let dim = node.kind == Kind::Other;
+
+        div()
+            .id(SharedString::from(format!("detail-row-{index}")))
+            .flex()
+            .items_center()
+            .h(px(DETAIL_ROW_H))
+            .px(px(4.0))
+            .flex_shrink_0()
+            .cursor_pointer()
+            .bg(if selected {
+                theme::accent_soft()
+            } else {
+                theme::surface()
+            })
+            .hover(|style| style.bg(theme::surface_alt()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.detail_click(click.clone(), cx);
+            }))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(6.0))
+                    .child(div().text_size(px(11.0)).child(glyph))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if dim {
+                                theme::text_dim()
+                            } else {
+                                theme::text()
+                            })
+                            .child(node.name.clone()),
+                    ),
+            )
+            .child(detail_cell(size, COL_SIZE, true))
+            .child(detail_cell(theme::format_count(node.files), COL_FILES, true))
+            .child(detail_cell(theme::format_count(node.dirs), COL_FOLDERS, true))
+            .child(detail_cell(status.to_string(), COL_STATUS, false))
+            .child(detail_cell(date, COL_MODIFIED, false))
+            .child(detail_cell(kind, COL_TYPE, false))
+            .into_any_element()
+    }
+
     // ---------------------------------------------------------------- render
 
     fn top_bar(&self, cx: &mut Context<Self>) -> Div {
-        div()
+        let mut bar = div()
             .h(px(TOPBAR_H))
             .flex_shrink_0()
             .flex()
@@ -831,7 +1469,6 @@ impl DiskApp {
                     ),
             )
             .child(div().flex_1())
-            .child(self.drive_select(cx))
             .child(
                 div()
                     .flex()
@@ -839,17 +1476,23 @@ impl DiskApp {
                     .gap(px(2.0))
                     .child(self.view_button(View::Rings, cx))
                     .child(self.view_button(View::Treemap, cx))
-                    .child(self.view_button(View::Heatmap, cx)),
-            )
-            .child(
+                    .child(self.view_button(View::Heatmap, cx))
+                    .child(self.view_button(View::Details, cx)),
+            );
+        // The metric toggle re-proportions the chart. The details table shows a
+        // size and a file count in its own columns, so the buttons mean nothing
+        // while it is open.
+        if self.view != View::Details {
+            bar = bar.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
                     .child(self.metric_button("Size", Metric::Bytes, cx))
                     .child(self.metric_button("Files", Metric::Files, cx)),
-            )
-            .child(self.theme_button(cx))
+            );
+        }
+        bar.child(self.theme_button(cx))
     }
 
     /// The Rescan button says what it will actually do: refresh the folder in
@@ -887,290 +1530,15 @@ impl DiskApp {
             .child(label)
     }
 
-    /// The active volume, if it is still plugged in.
+    /// The active volume, if it is still plugged in. A scan can be rooted at a
+    /// folder rather than at `E:\`, so an exact match is tried first and then
+    /// the drive whose root contains the open path.
     fn active_drive(&self) -> Option<&DriveInfo> {
-        self.drives
-            .iter()
-            .find(|drive| drive.root.eq_ignore_ascii_case(&self.last_root))
+        self.drives.iter().find(|drive| {
+            self.last_root.eq_ignore_ascii_case(&drive.root)
+                || is_inside(&drive.root, &self.last_root)
+        })
     }
-
-    /// The select in the top bar: one line for the open volume, a chevron that
-    /// opens the list of volumes underneath it.
-    fn drive_select(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
-        let active = self.active_drive();
-        let open = self.drives_open;
-        let title = match active {
-            Some(drive) => drive_title(drive),
-            None => "Choose volume".to_string(),
-        };
-        let usage = active
-            .map(|drive| {
-                format!(
-                    "{} free of {}",
-                    theme::format_bytes(drive.free),
-                    theme::format_bytes(drive.total)
-                )
-            })
-            .unwrap_or_default();
-        let fraction = active.map(usage_fraction).unwrap_or(0.0);
-        let measured = self.select_rect.clone();
-
-        div()
-            .id("drive-select")
-            .relative()
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .px(px(10.0))
-            .py(px(6.0))
-            .w(px(258.0))
-            .rounded(px(9.0))
-            .bg(if open {
-                theme::surface_alt()
-            } else {
-                theme::surface()
-            })
-            .border_1()
-            .border_color(if open { theme::accent() } else { theme::hairline() })
-            .cursor_pointer()
-            .hover(|style| style.bg(theme::surface_alt()))
-            .on_click(cx.listener(move |this, _, _, cx| this.toggle_drives(cx)))
-            // A one-pixel canvas is the only reliable way to learn where the
-            // select landed: element bounds are not exposed to the view.
-            .child(
-                canvas(
-                    move |bounds, _, _| {
-                        if let Ok(mut slot) = measured.lock() {
-                            *slot = (
-                                f32::from(bounds.origin.x),
-                                f32::from(bounds.origin.y),
-                                f32::from(bounds.size.width),
-                                f32::from(bounds.size.height),
-                            );
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .top(px(0.0))
-                .left(px(0.0))
-                .w_full()
-                .h_full(),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::text())
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(10.5))
-                            .text_color(theme::text_faint())
-                            .child(usage),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.0))
-                            .text_color(theme::text_dim())
-                            .child(if open { "▴" } else { "▾" }),
-                    ),
-            )
-            .child(
-                div()
-                    .h(px(3.0))
-                    .w_full()
-                    .rounded_full()
-                    .bg(theme::track())
-                    .child(
-                        div()
-                            .h_full()
-                            .rounded_full()
-                            .bg(if fraction > 0.9 {
-                                theme::danger()
-                            } else {
-                                theme::accent()
-                            })
-                            .w(px(238.0 * fraction)),
-                    ),
-            )
-    }
-
-    /// Where the volume list sits: directly under the select, in client pixels.
-    fn combo_rect(&self) -> (f32, f32, f32, f32) {
-        let (viewport_w, _) = self.viewport;
-        let (x, y, w, h) = self
-            .select_rect
-            .lock()
-            .map(|rect| *rect)
-            .unwrap_or((0.0, 0.0, 0.0, 0.0));
-        // Before the first frame measures the select, park the card on the
-        // right of the bar so it is never drawn somewhere absurd.
-        let (x, y, w, h) = if h > 0.0 {
-            (x, y, w, h)
-        } else {
-            ((viewport_w - 340.0).max(10.0), 10.0, 258.0, 44.0)
-        };
-        // The measuring canvas sits inside the select's padding box, so put the
-        // border (1 px) and padding (10 x 6) back to get the outer box.
-        let (x, y, w, h) = (x - 11.0, y - 7.0, w + 22.0, h + 14.0);
-        // The card hangs under the select, right edges flush: the select sits
-        // at the right end of the bar, so the card grows leftwards from it.
-        let left = (x + w - COMBO_W)
-            .min((viewport_w - COMBO_W - 10.0).max(10.0))
-            .max(10.0);
-        let height = COMBO_PAD * 2.0 + COMBO_HEADER_H + self.drives.len() as f32 * COMBO_ROW_H;
-        (left, y + h + 4.0, COMBO_W, height)
-    }
-
-    fn combo_contains(&self, x: f32, y: f32) -> bool {
-        let (left, top, width, height) = self.combo_rect();
-        x >= left && x <= left + width && y >= top && y <= top + height
-    }
-
-    /// Everything the chart canvas needs to paint the open volume list.
-    fn combo_snapshot(
-        &self,
-    ) -> Option<(Vec<DriveInfo>, String, Option<usize>, (f32, f32, f32, f32))> {
-        if !self.drives_open {
-            return None;
-        }
-        Some((
-            self.drives.clone(),
-            self.last_root.clone(),
-            self.combo_hover,
-            self.combo_rect(),
-        ))
-    }
-
-    /// Row under a client-space point, if the point is over one.
-    fn combo_row_at(&self, x: f32, y: f32) -> Option<usize> {
-        let (left, top, width, _) = self.combo_rect();
-        if x < left || x > left + width {
-            return None;
-        }
-        for index in 0..self.drives.len() {
-            let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
-            if y >= row_top && y < row_top + COMBO_ROW_H {
-                return Some(index);
-            }
-        }
-        None
-    }
-
-    fn toggle_drives(&mut self, cx: &mut Context<Self>) {
-        self.drives_open = !self.drives_open;
-        self.combo_hover = None;
-        if self.drives_open {
-            self.menu = None;
-            self.menu_hover = None;
-            self.hover = None;
-            self.tooltip = None;
-        }
-        cx.notify();
-    }
-
-    fn on_combo_move(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
-        let hover = self.combo_row_at(x, y);
-        if hover != self.combo_hover {
-            self.combo_hover = hover;
-            cx.notify();
-        }
-    }
-
-    fn on_combo_click(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
-        if self.combo_contains(x, y) {
-            if let Some(index) = self.combo_row_at(x, y) {
-                self.drives_open = false;
-                self.combo_hover = None;
-                if let Some(drive) = self.drives.get(index) {
-                    let root = drive.root.clone();
-                    if !self.last_root.eq_ignore_ascii_case(&root) {
-                        self.switch_to(root, cx);
-                    }
-                }
-                cx.notify();
-            }
-            return;
-        }
-        // Anywhere else dismisses the list without touching the chart.
-        self.drives_open = false;
-        self.combo_hover = None;
-        cx.notify();
-    }
-
-    /// Text for the open volume list. The card itself is painted by the chart
-    /// canvas (canvas paint uses client coordinates), so only the glyphs are
-    /// real elements.
-    fn combo_labels(&self) -> Vec<AnyElement> {
-        let (left, top, width, _) = self.combo_rect();
-        let mut out: Vec<AnyElement> = Vec::new();
-        out.push(combo_label(
-            left + 12.0 - PAD,
-            top + 7.0 - TOPBAR_H,
-            width - 24.0,
-            format!("VOLUMES · {}", self.drives.len()),
-            theme::text_faint(),
-            9.5,
-            FontWeight::NORMAL,
-            false,
-        ));
-        for (index, drive) in self.drives.iter().enumerate() {
-            let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
-            let active = drive.root.eq_ignore_ascii_case(&self.last_root);
-            out.push(combo_label(
-                left + 18.0 - PAD,
-                row_top + 6.5 - TOPBAR_H,
-                44.0,
-                drive.root.trim_end_matches('\\').to_string(),
-                theme::text(),
-                12.0,
-                FontWeight::SEMIBOLD,
-                false,
-            ));
-            if !drive.label.is_empty() {
-                out.push(combo_label(
-                    left + 58.0 - PAD,
-                    row_top + 8.0 - TOPBAR_H,
-                    120.0,
-                    drive.label.clone(),
-                    if active {
-                        theme::text_dim()
-                    } else {
-                        theme::text_faint()
-                    },
-                    10.5,
-                    FontWeight::NORMAL,
-                    false,
-                ));
-            }
-            out.push(combo_label(
-                left + width - 190.0 - PAD,
-                row_top + 8.0 - TOPBAR_H,
-                176.0,
-                format!(
-                    "{} free of {}",
-                    theme::format_bytes(drive.free),
-                    theme::format_bytes(drive.total)
-                ),
-                theme::text_faint(),
-                10.0,
-                FontWeight::NORMAL,
-                true,
-            ));
-        }
-        out
-    }
-
 
     fn view_button(&self, view: View, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
         let active = self.view == view;
@@ -1178,6 +1546,7 @@ impl DiskApp {
             View::Rings => "◎",
             View::Treemap => "▦",
             View::Heatmap => "▩",
+            View::Details => "☰",
         };
         div()
             .id(SharedString::from(format!("view-{glyph}")))
@@ -1321,15 +1690,22 @@ impl DiskApp {
         &mut self,
         viewport_w: f32,
         viewport_h: f32,
+        nav_w: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let content_w = viewport_w - PAD * 2.0;
+        // The navigation pane is a sibling, so its width is not part of the
+        // chart's share; `PANEL_W` only exists in the chart views.
+        let content_w = viewport_w - PAD * 2.0 - nav_w;
         let content_h = viewport_h - TOPBAR_H - STATUSBAR_H - PAD * 2.0;
         let available_w = content_w - PANEL_W - GAP;
         let side = available_w.min(content_h).max(240.0) - 4.0;
 
         let scanning = matches!(self.phase, Phase::Scanning);
+
+        if self.view == View::Details {
+            return self.details_area(cx).into_any_element();
+        }
 
         let Some(chart) = self.chart.clone() else {
             return div()
@@ -1457,11 +1833,6 @@ impl DiskApp {
             format!("{} · {} rings", self.metric.unit(), chart.rings)
         };
 
-        // The volume list is painted by the canvas, so text labels would sit on
-        // top of it; hide them while the list is open.
-        if self.drives_open {
-            labels.clear();
-        }
         let side_px = side;
         let rings = chart.rings;
         let store_prepaint = placed.clone();
@@ -1470,7 +1841,6 @@ impl DiskApp {
         let store_paint = placed.clone();
         let menu_paint = self.menu.clone();
         let menu_hover = self.menu_hover;
-        let combo_paint = self.combo_snapshot();
         let mut area = div()
             // The id is what lets the column own hover state: `on_hover` is only
             // available on stateful elements.
@@ -1509,16 +1879,6 @@ impl DiskApp {
                                 paint_sunburst(window, origin, &geom, &chart_paint, hover, &chain);
                                 if let Some(menu) = &menu_paint {
                                     paint_menu(window, origin, menu, menu_hover);
-                                }
-                                if let Some(combo) = &combo_paint {
-                                    paint_combo(
-                                        window,
-                                        &combo.0,
-                                        &combo.1,
-                                        combo.2,
-                                        combo.3 .0,
-                                        combo.3 .1,
-                                    );
                                 }
                             },
                         )
@@ -1583,9 +1943,6 @@ impl DiskApp {
                     this.on_chart_right_click(event, window, cx);
                 }),
             );
-        if self.drives_open {
-            area = area.children(self.combo_labels());
-        }
         // While a *different* volume is being walked, the chart on screen is
         // yesterday's news: veil it so nobody reads C: numbers as G: numbers.
         if scanning && !chart.focus.path.eq_ignore_ascii_case(&self.last_root) {
@@ -1695,18 +2052,12 @@ impl DiskApp {
         }
 
 
-        if self.drives_open {
-            labels.clear();
-            labels.extend(self.combo_labels());
-        }
-
         let chart_prepaint = chart.clone();
         let chart_paint = chart.clone();
         let store_prepaint = self.placed.clone();
         let paint_chain = chain.clone();
         let menu_paint_tiles = self.menu.clone();
         let menu_hover_tiles = self.menu_hover;
-        let combo_paint_tiles = self.combo_snapshot();
 
         if let Some(menu) = &self.menu {
             let origin = self
@@ -1780,16 +2131,6 @@ impl DiskApp {
                             );
                             if let Some(menu) = &menu_paint_tiles {
                                 paint_menu(window, bounds.origin, menu, menu_hover_tiles);
-                            }
-                            if let Some(combo) = &combo_paint_tiles {
-                                paint_combo(
-                                    window,
-                                    &combo.0,
-                                    &combo.1,
-                                    combo.2,
-                                    combo.3 .0,
-                                    combo.3 .1,
-                                );
                             }
                         },
                     )
@@ -2006,15 +2347,6 @@ impl DiskApp {
     }
 
     fn on_chart_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        // An open volume list owns the pointer, exactly like the menu does.
-        if self.drives_open {
-            self.on_combo_move(
-                f32::from(event.position.x),
-                f32::from(event.position.y),
-                cx,
-            );
-            return;
-        }
         // The menu takes over the pointer: rows light up, the chart stops
         // tracking hover so its tooltip does not fight the menu for space.
         if let Some(menu) = &self.menu {
@@ -2040,16 +2372,6 @@ impl DiskApp {
     }
 
     fn on_chart_click(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        // A press on the open volume list picks a volume or dismisses the list;
-        // either way it never reaches the chart behind it.
-        if self.drives_open {
-            self.on_combo_click(
-                f32::from(event.position.x),
-                f32::from(event.position.y),
-                cx,
-            );
-            return;
-        }
         // A press on an open menu resolves against its rows; a press anywhere
         // else dismisses it. Either way the chart underneath stays put.
         if let Some(menu) = self.menu.clone() {
@@ -2111,13 +2433,6 @@ impl DiskApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A right press on the open volume list just dismisses it.
-        if self.drives_open {
-            self.drives_open = false;
-            self.combo_hover = None;
-            cx.notify();
-            return;
-        }
         // A right press on an open menu just dismisses it.
         if let Some(menu) = self.menu.clone() {
             self.menu = None;
@@ -2158,9 +2473,7 @@ impl DiskApp {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.drives_open {
-                    self.drives_open = false;
-                } else if self.menu.is_some() {
+                if self.menu.is_some() {
                     self.menu = None;
                 } else if matches!(self.phase, Phase::Scanning) {
                     self.stop_scan(cx);
@@ -2174,10 +2487,20 @@ impl DiskApp {
             // Refresh the folder in the focus card, or the volume at the root.
             "f5" => self.rescan_focus(cx),
             "r" if event.keystroke.modifiers.control => self.rescan_focus(cx),
-            // 1 / 2 / 3 pick the visualisation, like the toolbar buttons.
+            // 1 / 2 / 3 / 4 pick the visualisation, like the toolbar buttons.
             "1" => self.set_view(View::Rings, cx),
             "2" => self.set_view(View::Treemap, cx),
             "3" => self.set_view(View::Heatmap, cx),
+            "4" => self.set_view(View::Details, cx),
+            // In the details view Enter opens the selected folder, as Explorer
+            // does; the other views have no selection to act on.
+            "enter" => {
+                if self.view == View::Details {
+                    if let Some(node) = self.selected_detail_node() {
+                        self.detail_open(node, cx);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -2498,27 +2821,17 @@ impl DiskApp {
     }
 
     fn status_bar(&self) -> Div {
+        // The card over the chart already carries the live counters, the path
+        // being walked and the Stop button, so the bar states the phase and the
+        // way out of it instead of repeating the same numbers underneath.
         let (left, right) = match &self.phase {
             Phase::Empty => ("Ready".to_string(), String::new()),
-            Phase::Scanning => {
-                let (files, bytes, path) = &self.progress;
-                (
-                    format!(
-                        "Scanning… {} files · {} · {}",
-                        theme::format_count(*files),
-                        theme::format_bytes(*bytes),
-                        short_name(path, 46)
-                    ),
-                    "Esc or Stop to pause".to_string(),
-                )
-            }
+            Phase::Scanning => (
+                "Scanning…".to_string(),
+                "Esc or Stop to pause".to_string(),
+            ),
             Phase::Stopped => (
-                format!(
-                    "Scan stopped · {} files · {} · {}",
-                    theme::format_count(self.progress.0),
-                    theme::format_bytes(self.progress.1),
-                    short_name(&self.progress.2, 46)
-                ),
+                "Scan stopped".to_string(),
                 self.note.clone().unwrap_or_default(),
             ),
             Phase::Ready {
@@ -2681,6 +2994,92 @@ fn stat(label: &str, value: String) -> Div {
         )
 }
 
+/// A small all-caps heading for the details view's navigation pane.
+fn section_label(text: &str) -> Div {
+    div()
+        .px(px(7.0))
+        .py(px(3.0))
+        .text_size(px(9.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(theme::text_faint())
+        .child(text.to_string())
+}
+
+/// `1 file` / `4 files`, for the details footer.
+fn count_label(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{count} {many}")
+    }
+}
+
+/// One fixed-width column of a details row.
+fn detail_cell(text: String, width: f32, right: bool) -> Div {    let mut cell = div()
+        .w(px(width))
+        .flex_shrink_0()
+        .px(px(6.0))
+        .truncate()
+        .text_size(px(11.0))
+        .text_color(theme::text_dim());
+    if right {
+        cell = cell.text_right();
+    }
+    cell.child(text)
+}
+
+/// The "Type" column: what Explorer would call this row.
+fn type_label(node: &Node) -> String {
+    if node.kind == Kind::Dir {
+        return "File folder".to_string();
+    }
+    if node.kind == Kind::Other {
+        return "—".to_string();
+    }
+    let extension = extension_of(&node.name);
+    if extension.is_empty() {
+        return "File".to_string();
+    }
+    match extension.as_str() {
+        "txt" | "log" | "rtf" => "Text Document".to_string(),
+        "md" => "Markdown Document".to_string(),
+        "pdf" => "PDF Document".to_string(),
+        "doc" | "docx" => "Word Document".to_string(),
+        "xls" | "xlsx" | "csv" => "Excel Worksheet".to_string(),
+        "ppt" | "pptx" => "PowerPoint Presentation".to_string(),
+        "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico" => "Image".to_string(),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" => "Video".to_string(),
+        "mp3" | "wav" | "flac" | "ogg" | "m4a" => "Audio".to_string(),
+        "zip" | "7z" | "rar" | "gz" | "tar" | "cab" => "Compressed Archive".to_string(),
+        "exe" => "Application".to_string(),
+        "dll" => "Application Extension".to_string(),
+        "sys" | "drv" => "System File".to_string(),
+        "iso" | "img" => "Disc Image".to_string(),
+        "json" => "JSON File".to_string(),
+        "xml" => "XML Document".to_string(),
+        "html" | "htm" => "HTML Document".to_string(),
+        "rs" => "Rust Source File".to_string(),
+        "cs" => "C# Source File".to_string(),
+        "js" => "JavaScript File".to_string(),
+        "ts" => "TypeScript File".to_string(),
+        "py" => "Python Source File".to_string(),
+        "ps1" => "PowerShell Script".to_string(),
+        "bat" | "cmd" => "Batch File".to_string(),
+        other => format!("{} File", other.to_ascii_uppercase()),
+    }
+}
+
+/// Lower-case extension without the dot, or an empty string for a name that
+/// has none (or only a leading dot).
+fn extension_of(name: &str) -> String {
+    match name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() && !extension.is_empty() => {
+            extension.to_ascii_lowercase()
+        }
+        _ => String::new(),
+    }
+}
+
 /// Draws the context menu onto the chart canvas.
 ///
 /// The card is painted from the canvas rather than a popup layer because popup
@@ -2761,133 +3160,6 @@ fn menu_label(
         .font_weight(weight)
         .child(text)
         .into_any_element()
-}
-
-/// Paint the open volume list: a compact card with the header rule, the active
-/// row marker and one usage bar per drive. Client coordinates, like the menu.
-fn paint_combo(
-    window: &mut Window,
-    drives: &[DriveInfo],
-    active_root: &str,
-    hover: Option<usize>,
-    left: f32,
-    top: f32,
-) {
-    let height = COMBO_PAD * 2.0 + COMBO_HEADER_H + drives.len() as f32 * COMBO_ROW_H;
-    let card = Bounds {
-        origin: point(px(left), px(top)),
-        size: size(px(COMBO_W), px(height)),
-    };
-    window.paint_quad(quad(
-        card,
-        px(10.0),
-        theme::surface_alt(),
-        px(1.0),
-        theme::hairline(),
-        BorderStyle::Solid,
-    ));
-
-    let rule = Bounds {
-        origin: point(px(left + 10.0), px(top + COMBO_PAD + COMBO_HEADER_H)),
-        size: size(px(COMBO_W - 20.0), px(1.0)),
-    };
-    window.paint_quad(quad(
-        rule,
-        px(0.0),
-        theme::hairline(),
-        px(0.0),
-        theme::hairline(),
-        BorderStyle::Solid,
-    ));
-
-    for (index, drive) in drives.iter().enumerate() {
-        let row_top = top + COMBO_PAD + COMBO_HEADER_H + index as f32 * COMBO_ROW_H;
-        let active = drive.root.eq_ignore_ascii_case(active_root);
-        if active || hover == Some(index) {
-            let row = Bounds {
-                origin: point(px(left + 4.0), px(row_top + 1.0)),
-                size: size(px(COMBO_W - 8.0), px(COMBO_ROW_H - 2.0)),
-            };
-            window.paint_quad(quad(
-                row,
-                px(7.0),
-                theme::accent_soft(),
-                px(0.0),
-                theme::accent_soft(),
-                BorderStyle::Solid,
-            ));
-        }
-        if active {
-            let mark = Bounds {
-                origin: point(px(left + 6.0), px(row_top + 10.0)),
-                size: size(px(2.5), px(COMBO_ROW_H - 20.0)),
-            };
-            window.paint_quad(quad(
-                mark,
-                px(1.0),
-                theme::accent(),
-                px(0.0),
-                theme::accent(),
-                BorderStyle::Solid,
-            ));
-        }
-
-        let fraction = usage_fraction(drive);
-        let bar_top = row_top + COMBO_ROW_H - 12.0;
-        let track = Bounds {
-            origin: point(px(left + 18.0), px(bar_top)),
-            size: size(px(COMBO_W - 36.0), px(3.0)),
-        };
-        window.paint_quad(quad(
-            track,
-            px(1.5),
-            theme::track(),
-            px(0.0),
-            theme::track(),
-            BorderStyle::Solid,
-        ));
-        if fraction > 0.0 {
-            let fill = Bounds {
-                origin: point(px(left + 18.0), px(bar_top)),
-                size: size(px((COMBO_W - 36.0) * fraction), px(3.0)),
-            };
-            let color = if fraction > 0.9 {
-                theme::danger()
-            } else {
-                theme::accent()
-            };
-            window.paint_quad(quad(fill, px(1.5), color, px(0.0), color, BorderStyle::Solid));
-        }
-    }
-}
-
-/// One line of text for the painted volume list, positioned inside the chart
-/// column (which is the chart canvas' coordinate origin for children).
-fn combo_label(
-    x: f32,
-    y: f32,
-    width: f32,
-    text: String,
-    color: gpui::Rgba,
-    size: f32,
-    weight: FontWeight,
-    right: bool,
-) -> AnyElement {
-    let mut label = div()
-        .absolute()
-        .left(px(x))
-        .top(px(y))
-        .w(px(width))
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .truncate()
-        .text_size(px(size))
-        .text_color(color)
-        .font_weight(weight);
-    if right {
-        label = label.text_right();
-    }
-    label.child(text).into_any_element()
 }
 
 fn ancestors(chart: &ChartModel, index: usize) -> HashSet<usize> {
@@ -3374,17 +3646,35 @@ impl Render for DiskApp {
             .child(self.top_bar(cx));
 
         root = root
-            .child(
-                div()
+            .child({
+                let focus = self.focus();
+                let nav_w = if focus.is_some() {
+                    NAV_W + GAP
+                } else {
+                    0.0
+                };
+                let mut row = div()
                     .flex_1()
                     .min_h_0()
                     .flex()
                     .flex_row()
                     .gap(px(GAP))
-                    .px(px(PAD))
-                    .child(self.chart_area(viewport_w, viewport_h, window, cx))
-                    .child(self.panel(cx)),
-            )
+                    .px(px(PAD));
+                // Same pane in every view: the volumes, then the open folder's
+                // chain. It disappears only before the first tree exists.
+                if let Some(focus) = &focus {
+                    row = row.child(self.detail_nav(focus, cx));
+                }
+                row = row.child(self.chart_area(viewport_w, viewport_h, nav_w, window, cx));
+                // The details table already lists the children with their
+                // numbers, so the breakdown panel would repeat itself. Before
+                // the first chart exists there is nothing to break down either,
+                // and an empty column would push the startup card off centre.
+                if self.view != View::Details && self.chart.is_some() {
+                    row = row.child(self.panel(cx));
+                }
+                row
+            })
             .child(self.status_bar());
 
         for layer in self.overlays(cx) {
