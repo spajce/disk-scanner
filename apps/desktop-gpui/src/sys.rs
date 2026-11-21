@@ -617,7 +617,10 @@ fn timestamp_utc() -> String {
 mod tests {
     use super::*;
 
+    // macOS asks Finder to do the move, which needs an interactive session, so
+    // the integration test only runs where the trash works without a desktop.
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn recycles_a_file_and_refuses_a_drive_root() {
         let dir = std::env::temp_dir().join(format!("disk-scanner-sys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
