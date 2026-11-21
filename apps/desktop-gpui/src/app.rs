@@ -30,6 +30,11 @@ const PANEL_W: f32 = 352.0;
 const GAP: f32 = 14.0;
 const PAD: f32 = 14.0;
 
+// The hover tooltip is an overlay card: fixed width, and tall enough for the
+// name, the path and the numbers line.
+const TOOLTIP_W: f32 = 280.0;
+const TOOLTIP_H: f32 = 84.0;
+
 struct ScanJob {
     cancel: Arc<AtomicBool>,
     /// Set while the walk is parked; cleared by Continue.
@@ -117,8 +122,28 @@ struct Placed {
     /// `ChartModel::slices`. Empty while the sunburst is showing.
     tiles: Arc<Vec<Tile>>,
     view: View,
+    /// The chart this layout was measured for. A hit test is only meaningful
+    /// against the chart that produced the geometry, so `pick` refuses data
+    /// that belongs to a chart no longer on screen.
+    chart: Option<Arc<ChartModel>>,
     /// Logical size of the drawing area measured during prepaint.
     size: (f32, f32),
+}
+
+impl Placed {
+    /// Whether this layout still describes what is on screen.
+    ///
+    /// The stored geometry is only valid for the view and the chart that
+    /// measured it. A treemap frame left behind, or the chart from before a
+    /// folder switch, would answer a hit test with slices the user is not
+    /// pointing at — so `pick` refuses it instead of guessing.
+    fn describes(&self, view: View, chart: &Arc<ChartModel>) -> bool {
+        self.view == view
+            && self
+                .chart
+                .as_ref()
+                .is_some_and(|measured| Arc::ptr_eq(measured, chart))
+    }
 }
 
 /// A finished scan kept around so switching back to a drive is instant.
@@ -182,6 +207,7 @@ impl DiskApp {
             geom: Geom::new(600.0, 1),
             tiles: Arc::new(Vec::new()),
             view: View::Rings,
+            chart: None,
             size: (0.0, 0.0),
         }));
         let theme_mode = load_theme_mode().unwrap_or(theme::Mode::System);
@@ -251,12 +277,27 @@ impl DiskApp {
         Node::find(tree, &self.focus_path).or_else(|| Some(tree.clone()))
     }
 
-    fn set_focus(&mut self, node: Arc<Node>, cx: &mut Context<Self>) {
-        self.focus_path = node.path.clone();
+    /// Install a chart for `node`, dropping everything derived from the pointer.
+    ///
+    /// `hover` and `tooltip` are slice *indices*, which only mean something for
+    /// the chart they were picked from: carrying one across a rebuild highlights
+    /// a folder nobody is pointing at, and a click on it opens that folder.
+    fn show_chart(&mut self, node: Arc<Node>) {
         self.chart = Some(Arc::new(build_chart(node, self.metric)));
+        self.clear_hover();
+        self.menu = None;
+        self.menu_hover = None;
+    }
+
+    /// Forget the hovered slice and its tooltip without notifying.
+    fn clear_hover(&mut self) {
         self.hover = None;
         self.tooltip = None;
-        self.menu = None;
+    }
+
+    fn set_focus(&mut self, node: Arc<Node>, cx: &mut Context<Self>) {
+        self.focus_path = node.path.clone();
+        self.show_chart(node);
         cx.notify();
     }
 
@@ -311,10 +352,9 @@ impl DiskApp {
         }
         self.metric = metric;
         if let Some(focus) = self.focus() {
-            self.chart = Some(Arc::new(build_chart(focus, metric)));
+            self.show_chart(focus);
         }
-        self.hover = None;
-        self.tooltip = None;
+        self.clear_hover();
         cx.notify();
     }
 
@@ -327,6 +367,7 @@ impl DiskApp {
         if let Some(cached) = self.cache.get(&key) {
                 let tree = cached.tree.clone();
                 let elapsed = cached.elapsed;
+                let cached_at = cached.at;
                 if let Some(job) = &self.job {
                     job.abort();
                 }
@@ -340,7 +381,7 @@ impl DiskApp {
                 };
                 self.tree = Some(tree.clone());
                 self.focus_path = focus.path.clone();
-                self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+                self.show_chart(focus);
                 self.phase = Phase::Ready {
                     elapsed,
                     files: tree.files,
@@ -348,12 +389,9 @@ impl DiskApp {
                 };
                 self.last_root = root.clone();
                 save_last_root(&root);
-                self.hover = None;
-                self.tooltip = None;
-                self.menu = None;
                 self.note = Some(format!(
                     "Showing the scan from {} ago — Rescan to refresh",
-                    theme::format_seconds(cached.at.elapsed().as_secs_f64())
+                    theme::format_seconds(cached_at.elapsed().as_secs_f64())
                 ));
                 cx.notify();
                 return;
@@ -461,8 +499,7 @@ impl DiskApp {
         });
         self.phase = Phase::Scanning;
         self.progress = (0, 0, target.clone());
-        self.hover = None;
-        self.tooltip = None;
+        self.clear_hover();
         self.menu = None;
         self.note = None;
 
@@ -487,7 +524,7 @@ impl DiskApp {
                 tree.clone()
             };
             self.focus_path = focus.path.clone();
-            self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+            self.show_chart(focus);
             self.tree = Some(tree);
         }
         cx.notify();
@@ -615,7 +652,7 @@ impl DiskApp {
                         let focus = Node::find(&merged, &self.focus_path)
                             .unwrap_or_else(|| merged.clone());
                         self.focus_path = focus.path.clone();
-                        self.chart = Some(Arc::new(build_chart(focus, self.metric)));
+                        self.show_chart(focus);
                         self.phase = Phase::Ready {
                             elapsed,
                             files: merged.files,
@@ -641,7 +678,7 @@ impl DiskApp {
                 }
 
                 self.focus_path = tree.path.clone();
-                self.chart = Some(Arc::new(build_chart(tree.clone(), self.metric)));
+                self.show_chart(tree.clone());
                 self.phase = Phase::Ready {
                     elapsed,
                     files: tree.files,
@@ -750,10 +787,7 @@ impl DiskApp {
             *bytes = bytes.saturating_sub(removed.size);
         }
         let node = Node::find(&pruned, &self.focus_path).unwrap_or(pruned);
-        self.chart = Some(Arc::new(build_chart(node, self.metric)));
-        self.hover = None;
-        self.tooltip = None;
-        self.menu = None;
+        self.show_chart(node);
         cx.notify();
     }
 
@@ -1289,7 +1323,7 @@ impl DiskApp {
         viewport_h: f32,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
         let content_w = viewport_w - PAD * 2.0;
         let content_h = viewport_h - TOPBAR_H - STATUSBAR_H - PAD * 2.0;
         let available_w = content_w - PANEL_W - GAP;
@@ -1305,18 +1339,24 @@ impl DiskApp {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(self.scan_card(cx));
+                .child(self.scan_card(cx))
+                .into_any_element()
         };
 
         if self.view != View::Rings {
-            return self.tiles_area(&chart, scanning, window, cx);
+            return self.tiles_area(&chart, scanning, window, cx).into_any_element();
         }
 
         let rings = chart.rings;
         let geom = Geom::new(side, rings);
         let placed = self.placed.clone();
         if let Ok(mut slot) = placed.lock() {
+            // Claim the layout for the sunburst. The tile canvas is the only
+            // other writer, and without this line a treemap frame left behind
+            // would keep serving hit tests for a picture that is not on screen.
             slot.geom = geom;
+            slot.view = View::Rings;
+            slot.chart = Some(chart.clone());
         }
 
         let hover = self.hover;
@@ -1425,12 +1465,16 @@ impl DiskApp {
         let side_px = side;
         let rings = chart.rings;
         let store_prepaint = placed.clone();
+        let chart_prepaint = chart.clone();
         let chart_paint = chart.clone();
         let store_paint = placed.clone();
         let menu_paint = self.menu.clone();
         let menu_hover = self.menu_hover;
         let combo_paint = self.combo_snapshot();
         let mut area = div()
+            // The id is what lets the column own hover state: `on_hover` is only
+            // available on stateful elements.
+            .id("chart-area")
             .relative()
             .flex_1()
             .min_w_0()
@@ -1452,6 +1496,8 @@ impl DiskApp {
                                 if let Ok(mut slot) = store_prepaint.lock() {
                                     slot.origin = bounds.origin;
                                     slot.geom = geom;
+                                    slot.view = View::Rings;
+                                    slot.chart = Some(chart_prepaint.clone());
                                 }
                                 geom
                             },
@@ -1516,6 +1562,15 @@ impl DiskApp {
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                 this.on_chart_move(event, cx);
             }))
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                // A highlight must not outlive the pointer that caused it: with
+                // the cursor in the panel, the ring would keep one folder lit
+                // and leave its tooltip hanging in mid-air.
+                if !*hovered && (this.hover.is_some() || this.tooltip.is_some()) {
+                    this.clear_hover();
+                    cx.notify();
+                }
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -1549,7 +1604,7 @@ impl DiskApp {
         } else if matches!(self.phase, Phase::Stopped) {
             area = area.child(self.stopped_pill(cx));
         }
-        area
+        area.into_any_element()
     }
 
     /// Treemap and heatmap share one canvas: rectangles from the model painted
@@ -1708,6 +1763,7 @@ impl DiskApp {
                                 slot.origin = bounds.origin;
                                 slot.tiles = tiles.clone();
                                 slot.view = view;
+                                slot.chart = Some(chart_prepaint.clone());
                                 slot.size = (w, h);
                             }
                             tiles
@@ -1908,6 +1964,14 @@ impl DiskApp {
     fn pick(&self, position: Point<Pixels>) -> Option<(usize, f32, f32)> {
         let chart = self.chart.as_ref()?;
         let slot = self.placed.lock().ok()?;
+        // The stored layout is whatever the last painted canvas measured: after
+        // a switch between rings and the tile views, or a new chart, those
+        // rectangles belong to a different picture. Hitting them anyway maps
+        // the pointer onto an unrelated slice, so the highlight, the tooltip
+        // and the folder a click opens would all name the wrong thing.
+        if !slot.describes(self.view, chart) {
+            return None;
+        }
         let local_x = f32::from(position.x - slot.origin.x);
         let local_y = f32::from(position.y - slot.origin.y);
         let index = match slot.view {
@@ -1922,7 +1986,23 @@ impl DiskApp {
                 .min_by(|a, b| a.1.area().total_cmp(&b.1.area()))
                 .map(|(index, _)| index),
         }?;
+        if index >= chart.slices.len() {
+            return None;
+        }
         Some((index, f32::from(position.x), f32::from(position.y)))
+    }
+
+    /// Highlight a slice from the breakdown list, so the ring and the list agree
+    /// on which folder is "the one under the pointer". No tooltip: the card
+    /// follows the pointer over the chart, and from the list it would sit on top
+    /// of the neighbouring rows while the row itself already shows the numbers.
+    fn hover_folder(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.hover == Some(index) && self.tooltip.is_none() {
+            return;
+        }
+        self.hover = Some(index);
+        self.tooltip = None;
+        cx.notify();
     }
 
     fn on_chart_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
@@ -2013,7 +2093,9 @@ impl DiskApp {
             return;
         }
         if let Some((index, _, _)) = self.pick(event.position) {
-            let node = chart.slices[index].node.clone();
+            let Some(node) = chart.slices.get(index).map(|slice| slice.node.clone()) else {
+                return;
+            };
             if node.is_dir() {
                 self.set_focus(node, cx);
             } else {
@@ -2049,7 +2131,9 @@ impl DiskApp {
         if let Some((index, x, y)) = picked {
             let chart = self.chart.clone();
             if let Some(chart) = chart {
-                let node = chart.slices[index].node.clone();
+                let Some(node) = chart.slices.get(index).map(|slice| slice.node.clone()) else {
+                    return;
+                };
                 if node.kind != Kind::Other && !node.path.is_empty() {
                     // Keep the card inside the window: it is painted by the
                     // canvas, which cannot scroll itself back into view.
@@ -2182,21 +2266,22 @@ impl DiskApp {
             let child_node = (*child).clone();
             let click_node = child_node.clone();
             let right_node = child_node.clone();
-            let hue = chart
+            let slice = chart
                 .slices
                 .iter()
-                .find(|slice| Arc::ptr_eq(&slice.node, child))
-                .map(|slice| slice.hue)
+                .position(|slice| Arc::ptr_eq(&slice.node, child));
+            let hue = slice
+                .map(|index| chart.slices[index].hue)
                 .unwrap_or(206.0);
             let color = if child.kind == Kind::Other {
                 theme::rest_color(1)
             } else {
                 theme::slice_color(hue, 1)
             };
-            let is_hover = self
-                .hover
-                .and_then(|hover| chart.slices.get(hover))
-                .is_some_and(|slice| Arc::ptr_eq(&slice.node, child));
+            // One hover state for both sides of the window: pointing at a row
+            // lights that folder's arc (and the other way round), so the list
+            // and the ring never describe two different folders.
+            let is_hover = slice.is_some() && self.hover == slice;
 
             rows.push(
                 div()
@@ -2214,6 +2299,19 @@ impl DiskApp {
                         theme::surface()
                     })
                     .hover(|style| style.bg(theme::surface_alt()))
+                    .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                        if let Some(index) = slice {
+                            this.hover_folder(index, cx);
+                        }
+                    }))
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        // Only this row's own highlight is cleared, so sliding
+                        // from row to row never blanks the ring in between.
+                        if !*hovered && slice.is_some() && this.hover == slice {
+                            this.clear_hover();
+                            cx.notify();
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if click_node.is_dir() {
                             this.set_focus(click_node.clone(), cx);
@@ -2463,13 +2561,18 @@ impl DiskApp {
                 } else {
                     0.0
                 };
-                let x = tooltip.x.min(f32::MAX);
+                // Keep the card on screen: the pointer can sit at the very edge
+                // of the window, and a tooltip half outside it is unreadable.
+                let max_x = (self.viewport.0 - TOOLTIP_W - 8.0).max(8.0);
+                let max_y = (self.viewport.1 - TOOLTIP_H - 8.0).max(8.0);
+                let x = (tooltip.x + 14.0).min(max_x).max(8.0);
+                let y = (tooltip.y + 16.0).min(max_y).max(8.0);
                 layers.push(
                     div()
                         .absolute()
-                        .left(px(x + 14.0))
-                        .top(px(tooltip.y + 16.0))
-                        .w(px(280.0))
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(TOOLTIP_W))
                         .p(px(9.0))
                         .rounded(px(9.0))
                         .bg(theme::surface_alt())
@@ -3343,6 +3446,106 @@ mod tests {
             kind: Kind::Dir,
             children,
         })
+    }
+
+    /// A small volume shaped like a system drive: nested folders whose sizes add
+    /// up to their parent, which is what the sunburst relies on.
+    fn sample_tree() -> Arc<Node> {
+        folder(
+            r"C:\",
+            r"C:\",
+            1000,
+            vec![
+                folder(
+                    "Users",
+                    r"C:\Users",
+                    500,
+                    vec![
+                        folder(
+                            "AppData",
+                            r"C:\Users\AppData",
+                            400,
+                            vec![
+                                folder("NVIDIA", r"C:\Users\AppData\NVIDIA", 300, Vec::new()),
+                                folder("Temp", r"C:\Users\AppData\Temp", 100, Vec::new()),
+                            ],
+                        ),
+                        folder("Docs", r"C:\Users\Docs", 100, Vec::new()),
+                    ],
+                ),
+                folder(
+                    "Program Files",
+                    r"C:\Program Files",
+                    300,
+                    vec![folder("Apps", r"C:\Program Files\Apps", 300, Vec::new())],
+                ),
+                folder("Windows", r"C:\Windows", 200, Vec::new()),
+            ],
+        )
+    }
+
+    #[test]
+    fn every_painted_arc_hit_tests_back_to_its_own_slice() {
+        // Pointing at a wedge must name the folder that wedge is drawn for.
+        // Getting this wrong is what made the ring highlight one folder while
+        // the tooltip and the click talked about another.
+        let chart = build_chart(sample_tree(), Metric::Bytes);
+        let geom = Geom::new(700.0, chart.rings);
+        assert!(chart.slices.len() >= 7, "the sample must draw several rings");
+
+        for (index, slice) in chart.slices.iter().enumerate() {
+            let (r0, r1) = geom.ring_bounds(slice.depth);
+            let radius = (r0 + r1) * 0.5;
+            let mid = slice.mid();
+            let x = geom.cx + radius * mid.cos();
+            let y = geom.cy + radius * mid.sin();
+            assert_eq!(
+                hit(&chart, &geom, x, y),
+                Some(index),
+                "the arc of {} must hit-test to itself",
+                slice.node.name
+            );
+        }
+    }
+
+    #[test]
+    fn the_hub_and_the_void_around_the_rings_hit_nothing() {
+        let chart = build_chart(sample_tree(), Metric::Bytes);
+        let geom = Geom::new(700.0, chart.rings);
+        assert_eq!(hit(&chart, &geom, geom.cx, geom.cy), None);
+        assert_eq!(
+            hit(&chart, &geom, geom.cx, geom.cy + geom.radius() + 20.0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_layout_from_another_view_or_chart_is_not_trusted() {
+        // The bug behind "hovering Program Files highlights something else":
+        // the rings view kept answering hit tests with the treemap cells the
+        // last tile frame had left in the shared layout.
+        let chart = Arc::new(build_chart(sample_tree(), Metric::Bytes));
+        let mut slot = Placed {
+            origin: point(px(0.), px(0.)),
+            geom: Geom::new(700.0, chart.rings),
+            tiles: Arc::new(Vec::new()),
+            view: View::Rings,
+            chart: Some(chart.clone()),
+            size: (700.0, 700.0),
+        };
+        assert!(slot.describes(View::Rings, &chart));
+
+        // A treemap frame left behind must not answer for the ring.
+        slot.view = View::Treemap;
+        assert!(!slot.describes(View::Rings, &chart));
+
+        // Nor may a chart from before a folder switch reuse the old geometry.
+        slot.view = View::Rings;
+        let other = Arc::new(build_chart(
+            folder("Windows", r"C:\Windows", 200, Vec::new()),
+            Metric::Bytes,
+        ));
+        assert!(!slot.describes(View::Rings, &other));
     }
 
     #[test]

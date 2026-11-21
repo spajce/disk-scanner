@@ -143,18 +143,21 @@ Explorer's *Size on disk* adds up to instead of the larger logical total.
 
 Requires Rust 1.85+, the MSVC toolchain and the Windows SDK.
 
-```bash
-cargo build --release          # target/release/disk-scanner.exe
-cargo run                      # debug build, scans the last folder you opened
-cargo test                     # scanner tests + Recycle Bin integration test
-```
-
-On a machine with several Visual Studio installs, run cargo inside a correctly configured
-environment instead:
+Run cargo through the environment wrapper. It picks a Visual Studio install whose MSVC
+toolset is actually complete, imports that install's `vcvars64.bat`, and only then starts
+cargo:
 
 ```powershell
-scripts\rust-env.ps1 cargo build --release
+scripts\rust-env.ps1 cargo build --release   # target/release/disk-scanner.exe
+scripts\rust-env.ps1 cargo run               # debug build, scans the last folder you opened
+scripts\rust-env.ps1 cargo test              # scanner tests + Recycle Bin integration test
 ```
+
+On a machine with a single, complete Visual Studio install the wrapper is unnecessary and
+plain `cargo build`, `cargo run` and `cargo test` behave identically. See
+[Running on a machine with several Visual Studio installs](#running-on-a-machine-with-several-visual-studio-installs)
+for what the wrapper compensates for — on this machine a plain `cargo run` cannot work,
+so a bare `cargo build` failure is the expected symptom, not a broken crate.
 
 The app remembers the last scanned root in `%APPDATA%\disk-scanner\last-root.txt` and
 rescans it on start (falling back to the first fixed drive). Scans are cached per volume for the
