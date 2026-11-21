@@ -8,9 +8,9 @@ and a sortable details table.
 
 ![Disk Scanner](docs/screenshot.png)
 
-| Sunburst | Treemap | Heatmap |
-| --- | --- | --- |
-| ![Sunburst](docs/screenshot.png) | ![Treemap](docs/treemap.png) | ![Heatmap](docs/heatmap.png) |
+| Sunburst | Treemap | Heatmap | Details |
+| --- | --- | --- | --- |
+| ![Sunburst](docs/screenshot.png) | ![Treemap](docs/treemap.png) | ![Heatmap](docs/heatmap.png) | ![Details](docs/details.png) |
 
 ## Download
 
