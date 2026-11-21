@@ -8,8 +8,8 @@ use std::sync::{LazyLock, RwLock};
 
 use gpui::{hsla, Hsla, Rgba};
 
-/// Which skin the app should wear. `System` follows the Windows
-/// "Choose your default app mode" setting.
+/// Which skin the app should wear. `System` follows the desktop's own light or
+/// dark appearance setting.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     System,

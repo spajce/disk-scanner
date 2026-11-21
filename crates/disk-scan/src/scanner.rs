@@ -10,20 +10,25 @@
 //! * single-directory chains (`a/b/c`) are merged into one arc,
 //! * a global node budget guarantees a bounded payload.
 
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
+
+#[cfg(windows)]
+use std::ffi::OsString;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStringExt;
 
 use rayon::prelude::*;
 use serde::Serialize;
 
 /// `FILE_ATTRIBUTE_REPARSE_POINT` — junctions, mount points and friends.
+#[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
 /// Entries whose on-disk footprint can be smaller (or larger) than their
 /// logical length: sparse files, NTFS-compressed files, and cloud
 /// placeholders that only hold metadata locally.
+#[cfg(windows)]
 const TIGHTLY_PACKED_ATTRIBUTES: u32 = 0x0200 | 0x0800 | 0x0040_0000 | 0x1000;
 /// Only files this big are checked for hard links: opening a handle costs about
 /// as much as listing a directory, and linking a 40 KiB file is not worth it.
@@ -171,12 +176,10 @@ struct Listing {
     errors: u64,
 }
 
-/// Read a directory through `FindFirstFileW`, which returns the attributes and
-/// the size together. `std::fs::read_dir` + `DirEntry::metadata` costs a second
-/// syscall per entry, and a system drive has millions of them.
 /// `true` when this file's bytes have not been counted yet, `false` when it is
 /// another name for a file already walked. Files with a single link are never
 /// remembered, so the set only ever holds the genuinely shared ones.
+#[cfg(windows)]
 fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -223,9 +226,10 @@ fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>)
     }
 }
 
-/// Size a file actually occupies on the volume, which is what Explorer and `df`
-/// report: sparse and compressed files take less, cloud placeholders take
-/// almost nothing until they are downloaded.
+/// Size a file actually occupies on the volume: sparse and compressed files
+/// take less, cloud placeholders take almost nothing until they are downloaded.
+/// Unix reports the same number as `st_blocks`, so only Windows needs this.
+#[cfg(windows)]
 fn allocated_size(path: &Path, logical: u64) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
 
@@ -244,7 +248,12 @@ fn allocated_size(path: &Path, logical: u64) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-fn list_dir(dir: &Path) -> Option<Listing> {    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+/// Read a directory through `FindFirstFileW`, which returns the attributes and
+/// the size together. `std::fs::read_dir` + `DirEntry::metadata` costs a second
+/// syscall per entry, and a system drive has millions of them.
+#[cfg(windows)]
+fn list_dir(dir: &Path) -> Option<Listing> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
         WIN32_FIND_DATAW,
@@ -332,6 +341,92 @@ fn list_dir(dir: &Path) -> Option<Listing> {    use windows_sys::Win32::Foundati
     unsafe { FindClose(handle) };
 
     Some(listing)
+}
+
+/// Read a directory with `read_dir`.
+///
+/// A Unix listing carries no size, so every entry costs one `stat` — the same
+/// price `du` pays. That buys the on-disk size (`st_blocks`), which is what the
+/// app reports: a sparse file counts the space it occupies, not what it claims.
+#[cfg(unix)]
+fn list_dir(dir: &Path) -> Option<Listing> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut listing = Listing {
+        subdirs: Vec::new(),
+        files: Vec::new(),
+        files_seen: 0,
+        bytes: 0,
+        errors: 0,
+    };
+
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                listing.errors += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        // `symlink_metadata` never follows the link: a link back to a parent
+        // cannot trap the walk, and a link to a big file is not counted twice.
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
+            Err(_) => {
+                listing.errors += 1;
+                continue;
+            }
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            listing.subdirs.push(path);
+            continue;
+        }
+        if !kind.is_file() {
+            // Sockets, FIFOs and device nodes hold no meaningful bytes.
+            continue;
+        }
+
+        // `st_blocks` counts 512-byte units on every Unix, so this is the space
+        // the file really occupies. Filesystems that keep small files inline
+        // report zero blocks; fall back to the logical length there.
+        let allocated = meta.blocks().saturating_mul(512);
+        let size = if allocated == 0 { meta.len() } else { allocated };
+        listing.files_seen += 1;
+        listing.bytes += size;
+        if size >= FILE_FLOOR {
+            listing.files.push((size, path));
+        }
+    }
+
+    Some(listing)
+}
+
+/// `true` when this file's bytes have not been counted yet, `false` when it is
+/// another name for a file already walked. `st_nlink` is in the `stat` the walk
+/// already paid for, so a hard link costs the same as any other file here.
+#[cfg(unix)]
+fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(_) => return true,
+    };
+    if meta.nlink() <= 1 {
+        return true;
+    }
+    let identity = (meta.dev(), meta.ino());
+    match links.lock() {
+        Ok(mut set) => set.insert(identity),
+        // A poisoned lock means another thread panicked; keep the bytes rather
+        // than silently dropping them from the totals.
+        Err(_) => true,
+    }
 }
 
 
@@ -606,6 +701,7 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
 }
 
 /// `C:\` -> `\\?\C:\` so paths beyond MAX_PATH still work.
+#[cfg(windows)]
 fn verbatim(path: &Path) -> PathBuf {
     let text = path.to_string_lossy();
     if text.starts_with(r"\\?\") {
@@ -748,7 +844,11 @@ mod tests {
 
         let raw = scan_tree(&tree.0);
         for child in &raw.children {
-            let last = child.path.rsplit('\\').next().unwrap_or_default();
+            let last = child
+                .path
+                .rsplit(std::path::MAIN_SEPARATOR)
+                .next()
+                .unwrap_or_default();
             assert_eq!(
                 child.name, last,
                 "a node's name must come from its own path, not a neighbour's"

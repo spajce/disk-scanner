@@ -1284,6 +1284,7 @@ dependencies = [
  "disk-scan",
  "embed-resource",
  "gpui",
+ "libc",
  "rayon",
  "windows-sys 0.59.0",
 ]

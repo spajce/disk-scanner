@@ -296,8 +296,8 @@ impl DiskApp {
             detail_meta_for: None,
         };
 
-        // Follow the OS while the skin is on "Auto": the registry value changes
-        // when the user flips Windows between light and dark.
+        // Follow the OS while the skin is on "Auto": the system appearance can
+        // change at any time, and the probe is cheap enough to repeat.
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
                 .timer(Duration::from_secs(3))
@@ -2942,6 +2942,7 @@ impl DiskApp {
 
 /// Splits an absolute path into `(label, full path)` pairs, one per level, so
 /// the panel can render it as a breadcrumb.
+#[cfg(windows)]
 fn breadcrumb_segments(path: &str) -> Vec<(String, String)> {
     let trimmed = path.trim_end_matches('\\');
     // UNC shares and verbatim paths keep a single, unsplittable label.
@@ -2971,6 +2972,24 @@ fn breadcrumb_segments(path: &str) -> Vec<(String, String)> {
     }
     if out.is_empty() {
         return vec![(trimmed.to_string(), path.to_string())];
+    }
+    out
+}
+
+/// Same contract for POSIX paths: `/` is the first level, then one entry per
+/// directory below it.
+#[cfg(not(windows))]
+fn breadcrumb_segments(path: &str) -> Vec<(String, String)> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return vec![("/".to_string(), "/".to_string())];
+    }
+    let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
+    let mut prefix = String::new();
+    for part in trimmed.split('/').filter(|part| !part.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(part);
+        out.push((part.to_string(), prefix.clone()));
     }
     out
 }
@@ -3431,15 +3450,23 @@ fn keep_deeper(best: &mut Option<Arc<Node>>, candidate: Arc<Node>) {
 }
 
 /// True when `child` sits somewhere below `parent` (`C:\` contains `C:\Users`).
+/// Whether `child` lives inside `parent`. The comparison is case-insensitive on
+/// Windows and case-sensitive elsewhere, and the separator has to follow the
+/// prefix so `/home/bob` is not mistaken for a child of `/home/bo`.
 fn is_inside(parent: &str, child: &str) -> bool {
     if parent.len() >= child.len() {
         return false;
     }
+    let separator = std::path::MAIN_SEPARATOR;
     let (parent_bytes, child_bytes) = (parent.as_bytes(), child.as_bytes());
-    if !child_bytes[..parent_bytes.len()].eq_ignore_ascii_case(parent_bytes) {
+    let matches = child_bytes[..parent_bytes.len()]
+        .iter()
+        .zip(parent_bytes)
+        .all(|(a, b)| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b });
+    if !matches {
         return false;
     }
-    parent.ends_with('\\') || child_bytes[parent_bytes.len()] == b'\\'
+    parent.ends_with(separator) || child_bytes[parent_bytes.len()] as char == separator
 }
 
 /// Swap the subtree at `target` for a freshly walked one, moving the size / file
@@ -3525,13 +3552,26 @@ fn prune(node: &Arc<Node>, target: &str) -> Arc<Node> {
     })
 }
 
+/// Where the app keeps its small state files: `%APPDATA%\disk-scanner` on
+/// Windows, `$XDG_CONFIG_HOME/disk-scanner` (or `~/.config/disk-scanner`)
+/// everywhere else.
+#[cfg(windows)]
+fn config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("APPDATA").map(|base| std::path::PathBuf::from(base).join("disk-scanner"))
+}
+
+#[cfg(not(windows))]
+fn config_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .map(|base| base.join("disk-scanner"))
+}
+
 fn last_root_path() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(
-        std::path::PathBuf::from(appdata)
-            .join("disk-scanner")
-            .join("last-root.txt"),
-    )
+    Some(config_dir()?.join("last-root.txt"))
 }
 
 fn load_last_root() -> Option<String> {
@@ -3552,17 +3592,25 @@ fn save_last_root(root: &str) {
     let _ = std::fs::write(path, root);
 }
 
+/// Cache key for a scanned root: Windows paths are case-insensitive, so they
+/// are folded; a POSIX path is kept as written, minus a trailing slash.
+#[cfg(windows)]
 fn cache_key(root: &str) -> String {
     root.replace('/', "\\").to_lowercase()
 }
 
+#[cfg(not(windows))]
+fn cache_key(root: &str) -> String {
+    let trimmed = root.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn theme_path() -> Option<std::path::PathBuf> {
-    let appdata = std::env::var("APPDATA").ok()?;
-    Some(
-        std::path::PathBuf::from(appdata)
-            .join("disk-scanner")
-            .join("theme.txt"),
-    )
+    Some(config_dir()?.join("theme.txt"))
 }
 
 fn load_theme_mode() -> Option<theme::Mode> {
@@ -3590,10 +3638,7 @@ fn initial_view() -> View {
 }
 
 fn view_path() -> Option<std::path::PathBuf> {
-    let mut path = std::env::var_os("APPDATA").map(std::path::PathBuf::from)?;
-    path.push("disk-scanner");
-    path.push("view.txt");
-    Some(path)
+    Some(config_dir()?.join("view.txt"))
 }
 
 fn load_view() -> Option<View> {
@@ -3921,6 +3966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn recognises_nested_paths() {
         assert!(is_inside(r"C:\", r"C:\Users"));
         assert!(is_inside(r"C:\Users", r"C:\Users\jcarillo"));
@@ -3929,6 +3975,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn recognises_nested_paths() {
+        assert!(is_inside("/", "/home"));
+        assert!(is_inside("/home", "/home/bob"));
+        assert!(!is_inside("/home", "/homebob"));
+        assert!(!is_inside("/home", "/home"));
+        assert!(!is_inside("/Home", "/home/bob"));
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn splits_a_folder_path_into_clickable_levels() {
         let crumbs = breadcrumb_segments(r"C:\Users\jcarillo\AppData\Local\Xamarin");
         let labels: Vec<_> = crumbs.iter().map(|(label, _)| label.as_str()).collect();
@@ -3951,12 +4008,34 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn keeps_a_drive_root_as_one_segment() {
         assert_eq!(breadcrumb_segments(r"C:\"), vec![("C:".into(), r"C:\".into())]);
         assert_eq!(breadcrumb_segments(r"C:"), vec![("C:".into(), r"C:\".into())]);
     }
 
     #[test]
+    #[cfg(not(windows))]
+    fn splits_a_folder_path_into_clickable_levels() {
+        let crumbs = breadcrumb_segments("/home/bob/Pictures");
+        let labels: Vec<_> = crumbs.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["/", "home", "bob", "Pictures"]);
+        let paths: Vec<_> = crumbs.iter().map(|(_, path)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["/", "/home", "/home/bob", "/home/bob/Pictures"]
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn the_root_is_one_segment() {
+        assert_eq!(breadcrumb_segments("/"), vec![("/".into(), "/".into())]);
+        assert_eq!(breadcrumb_segments(""), vec![("/".into(), "/".into())]);
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn leaves_unc_paths_alone() {
         let unc = r"\\server\share\folder";
         assert_eq!(breadcrumb_segments(unc), vec![(unc.into(), unc.into())]);

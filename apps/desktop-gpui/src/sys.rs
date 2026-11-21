@@ -1,6 +1,12 @@
-//! Shell integration: open Explorer at a path, send a folder to the Recycle Bin.
+//! Shell integration: reveal a path in the file manager, move items to the
+//! trash, ask a yes/no question and follow the system appearance.
+//!
+//! Every entry point here has one implementation per platform in this file, so
+//! the app calls the same names on Windows, macOS and Linux.
 
 use std::process::Command;
+
+#[cfg(windows)]
 use windows_sys::Win32::UI::Shell::{
     SHFileOperationW, SHFILEOPSTRUCTW, FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
     FOF_NOERRORUI, FOF_SILENT,
@@ -9,6 +15,7 @@ use windows_sys::Win32::UI::Shell::{
 /// True when Windows is set to light mode for apps
 /// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize` →
 /// `AppsUseLightTheme`). Unreadable keys fall back to the dark default.
+#[cfg(windows)]
 pub fn system_prefers_light() -> bool {
     use windows_sys::Win32::System::Registry::{
         RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD,
@@ -38,9 +45,83 @@ pub fn system_prefers_light() -> bool {
     status == 0 && data != 0
 }
 
+/// The appearance is asked of the desktop through a helper process, and the app
+/// re-checks it every few seconds, so an answer is reused for a moment instead
+/// of spawning one every time.
+#[cfg(unix)]
+fn cached_probe(probe: impl FnOnce() -> bool) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    static LAST: OnceLock<Mutex<Option<(Instant, bool)>>> = OnceLock::new();
+    let cache = LAST.get_or_init(|| Mutex::new(None));
+    let Ok(mut slot) = cache.lock() else {
+        // A poisoned lock only means another thread panicked here; the answer
+        // itself is still available by asking again.
+        return probe();
+    };
+    if let Some((at, value)) = *slot {
+        if at.elapsed() < Duration::from_secs(10) {
+            return value;
+        }
+    }
+    let value = probe();
+    *slot = Some((Instant::now(), value));
+    value
+}
+
+/// True in light mode: `AppleInterfaceStyle` exists only while dark mode is on,
+/// so its absence is the light answer. A machine where the key cannot be read
+/// keeps the light default a stock desktop starts in.
+#[cfg(target_os = "macos")]
+pub fn system_prefers_light() -> bool {
+    cached_probe(|| {
+        Command::new("defaults")
+            .args(["read", "-g", "AppleInterfaceStyle"])
+            .output()
+            .map(|output| {
+                let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
+                !(output.status.success() && text.contains("dark"))
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// True in light mode: GNOME publishes the answer as a colour scheme, and a
+/// theme whose name says "dark" settles it on desktops that do not.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn system_prefers_light() -> bool {
+    cached_probe(|| {
+        let read = |key: &str| -> Option<String> {
+            let output = Command::new("gsettings")
+                .args(["get", "org.gnome.desktop.interface", key])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            Some(String::from_utf8_lossy(&output.stdout).to_lowercase())
+        };
+
+        if let Some(scheme) = read("color-scheme") {
+            if scheme.contains("dark") {
+                return false;
+            }
+            if scheme.contains("light") || scheme.contains("default") {
+                return true;
+            }
+        }
+        match read("gtk-theme") {
+            Some(theme) => !theme.contains("dark"),
+            None => true,
+        }
+    })
+}
+
 /// Reveal `path` in Explorer: a folder opens itself, a file is selected inside
 /// its parent. `is_dir` comes from the scan rather than the filesystem so a
 /// folder that vanished since the scan still opens where the user expects.
+#[cfg(windows)]
 pub fn reveal(path: &str, is_dir: bool) {
     let status = if is_dir {
         Command::new("explorer.exe").arg(path).spawn()
@@ -54,17 +135,52 @@ pub fn reveal(path: &str, is_dir: bool) {
     }
 }
 
+/// Reveal `path` in the desktop file manager: macOS selects the item inside its
+/// parent with `open -R`, Linux opens the folder with `xdg-open`.
+#[cfg(unix)]
+pub fn reveal(path: &str, is_dir: bool) {
+    #[cfg(target_os = "macos")]
+    let args: Vec<String> = if is_dir {
+        vec![path.to_string()]
+    } else {
+        vec!["-R".to_string(), path.to_string()]
+    };
+    #[cfg(not(target_os = "macos"))]
+    let args: Vec<String> = {
+        let target = if is_dir {
+            std::path::PathBuf::from(path)
+        } else {
+            std::path::Path::new(path)
+                .parent()
+                .map(|parent| parent.to_path_buf())
+                .unwrap_or_else(|| std::path::PathBuf::from(path))
+        };
+        vec![target.to_string_lossy().into_owned()]
+    };
+
+    if let Err(error) = Command::new("xdg-open").args(&args).spawn() {
+        eprintln!("could not open the file manager: {error}");
+    }
+}
+
 /// Handle of the window that owns the current keyboard focus, used as the owner
 /// of the confirmation box so it stays attached to this app.
+#[cfg(windows)]
 pub fn active_window() -> isize {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 
     unsafe { GetActiveWindow() as isize }
 }
 
-/// `Date modified` for one path, as Explorer prints it: the local clock in
-/// 12-hour form (`3/26/2025 10:49 pm`), together with the raw timestamp so the
-/// list can sort on the real value instead of the text.
+/// A shell dialog on Unix is its own process, so no owner handle is needed.
+#[cfg(unix)]
+pub fn active_window() -> isize {
+    0
+}
+
+/// `Date modified` for one path as the file manager prints it: the local clock
+/// in 12-hour form (`3/26/2025 10:49 pm`), together with the raw timestamp so
+/// the list can sort on the real value instead of the text.
 ///
 /// Both halves are read on a worker thread; a path that vanished since the scan
 /// simply has no date.
@@ -78,6 +194,7 @@ pub fn modified(path: &str) -> Option<(std::time::SystemTime, String)> {
 /// clock. `SYSTEMTIME`/`TzSpecificLocalTime` are used rather than arithmetic
 /// because they follow the zone (and its daylight-saving rules) Windows has
 /// configured for the user.
+#[cfg(windows)]
 fn format_local(stamp: std::time::SystemTime) -> Option<String> {
     use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
     use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
@@ -125,8 +242,37 @@ fn format_local(stamp: std::time::SystemTime) -> Option<String> {
     ))
 }
 
+/// The same shape through `localtime_r`: the C library applies the zone and its
+/// daylight-saving rules, so the printed clock matches the desktop clock.
+#[cfg(unix)]
+fn format_local(stamp: std::time::SystemTime) -> Option<String> {
+    let seconds = stamp.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `tm` is a stack value written by `localtime_r`, and the input is
+    // a plain integer.
+    if unsafe { libc::localtime_r(&seconds, &mut tm) }.is_null() {
+        return None;
+    }
+    let hour = match tm.tm_hour % 12 {
+        0 => 12,
+        other => other,
+    };
+    let suffix = if tm.tm_hour < 12 { "am" } else { "pm" };
+    Some(format!(
+        "{}/{}/{} {}:{:02} {}",
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_year + 1900,
+        hour,
+        tm.tm_min,
+        suffix
+    ))
+}
+
+#[cfg(windows)]
 static ICON_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+#[cfg(windows)]
 unsafe extern "system" fn find_own_window(
     hwnd: windows_sys::Win32::Foundation::HWND,
     _param: windows_sys::Win32::Foundation::LPARAM,
@@ -146,6 +292,7 @@ unsafe extern "system" fn find_own_window(
 ///
 /// GPUI never sets `WM_SETICON`, so without this the taskbar and alt-tab fall
 /// back to the generic application icon.
+#[cfg(windows)]
 pub fn apply_window_icon() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -191,10 +338,16 @@ pub fn apply_window_icon() {
     }
 }
 
+/// The icon is embedded in the executable on Windows; the other platforms take
+/// it from the bundle or the desktop entry instead.
+#[cfg(unix)]
+pub fn apply_window_icon() {}
+
 /// Ask a yes/no question in a native Windows message box.
 ///
 /// Runs on a background thread so the UI keeps painting while it is open; the
 /// default button is **No**, and closing the box answers No.
+#[cfg(windows)]
 pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         MessageBoxW, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, IDYES,
@@ -225,6 +378,7 @@ pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
 }
 
 /// Move `path` to the Recycle Bin. Returns a human readable error on failure.
+#[cfg(windows)]
 pub fn recycle(path: &str) -> Result<(), String> {
     let target = std::path::Path::new(path);
     if target.parent().is_none() {
@@ -260,6 +414,205 @@ pub fn recycle(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Ask a yes/no question in a native dialog before anything is deleted.
+///
+/// macOS answers through `osascript`; Linux through whichever of the two
+/// common dialog tools is installed. With no dialog available the answer is
+/// No — refusing is better than deleting without asking.
+#[cfg(unix)]
+pub fn confirm(_owner: isize, title: &str, text: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "display dialog \"{text}\" with title \"{title}\" buttons {{\"No\", \"Yes\"}} default button \"No\"",
+            text = escape_apple_script(text),
+            title = escape_apple_script(title),
+        );
+        let Ok(output) = Command::new("osascript").args(["-e", &script]).output() else {
+            return false;
+        };
+        return output.status.success()
+            && String::from_utf8_lossy(&output.stdout).contains("button returned:Yes");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let attempts: [(&str, Vec<&str>); 2] = [
+            (
+                "zenity",
+                vec![
+                    "--question",
+                    "--no-wrap",
+                    "--title",
+                    title,
+                    "--text",
+                    text,
+                ],
+            ),
+            ("kdialog", vec!["--title", title, "--yesno", text]),
+        ];
+        for (program, args) in attempts {
+            match Command::new(program).args(&args).status() {
+                Ok(status) => return status.success(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+}
+
+/// Move `path` to the desktop trash.
+///
+/// The glib and trash-cli tools pick the trash of the volume the item lives on;
+/// without either, the freedesktop layout under the data directory is used,
+/// which covers the home volume.
+#[cfg(unix)]
+pub fn recycle(path: &str) -> Result<(), String> {
+    let target = std::path::Path::new(path);
+    if target.parent().is_none() {
+        return Err("refusing to delete a volume root".to_string());
+    }
+    if !target.exists() {
+        return Err(format!("{path} no longer exists"));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"Finder\" to delete POSIX file \"{}\"",
+            escape_apple_script(path)
+        );
+        return match Command::new("osascript").args(["-e", &script]).status() {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => Err("could not move the item to the Trash".to_string()),
+            Err(error) => Err(format!("could not run osascript: {error}")),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for program in ["gio", "trash-put"] {
+            let mut command = Command::new(program);
+            if program == "gio" {
+                command.arg("trash");
+            }
+            match command.arg(path).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) => {
+                    return Err(format!("{program} could not move the item to the trash"));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("could not run {program}: {error}")),
+            }
+        }
+        trash_to_data_dir(path)
+    }
+}
+
+/// `"...` and `\` are the two characters AppleScript string literals care
+/// about, so the paths and titles handed to `osascript` are escaped first.
+#[cfg(target_os = "macos")]
+fn escape_apple_script(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// The freedesktop trash: `files/` holds the item, `info/` a small
+/// `.trashinfo` recording where it came from so the desktop can restore it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn trash_to_data_dir(path: &str) -> Result<(), String> {
+    let source = std::path::Path::new(path);
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".local").join("share"))
+        })
+        .ok_or("no data directory to keep a trash in")?;
+    let files = data.join("Trash").join("files");
+    let info = data.join("Trash").join("info");
+    for dir in [&files, &info] {
+        std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+
+    let name = source
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or("refusing to delete a volume root")?;
+    // Two items can share a name; the spec allows `.2`, `.3` suffixes.
+    let mut candidate = name.clone();
+    let mut counter = 1;
+    while files.join(&candidate).exists() || info.join(format!("{candidate}.trashinfo")).exists() {
+        counter += 1;
+        candidate = format!("{name}.{counter}");
+    }
+    let moved = files.join(&candidate);
+    std::fs::rename(source, &moved)
+        .map_err(|error| format!("could not move the item to the trash: {error}"))?;
+
+    let entry = format!(
+        "[Trash Info]\nPath={}\nDeletionDate={}\n",
+        percent_encode(source),
+        timestamp_utc()
+    );
+    if let Err(error) = std::fs::write(info.join(format!("{candidate}.trashinfo")), entry) {
+        // Put the item back rather than leave a trash entry nothing can restore.
+        let _ = std::fs::rename(&moved, source);
+        return Err(format!("could not record the deletion: {error}"));
+    }
+    Ok(())
+}
+
+/// Percent-encode a path the way `.trashinfo` expects: everything outside the
+/// URL-unreserved set becomes `%XX`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn percent_encode(path: &std::path::Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut out = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        let plain = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/');
+        if plain {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// `YYYY-MM-DDThh:mm:ss` in UTC, which is what `DeletionDate` carries.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn timestamp_utc() -> String {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let (days, rest) = ((seconds / 86_400) as i64, seconds % 86_400);
+    // Days since 1970-01-01 → calendar date, without pulling in a date crate.
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 { shifted } else { shifted - 146_096 } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_position = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_position + 2) / 5 + 1;
+    let month = if month_position < 10 {
+        month_position + 3
+    } else {
+        month_position - 9
+    };
+    let year = year_of_era + era * 400 + if month <= 2 { 1 } else { 0 };
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+        rest / 3_600,
+        (rest % 3_600) / 60,
+        rest % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +628,9 @@ mod tests {
         assert!(!file.exists(), "file should be out of the working tree");
 
         let _ = std::fs::remove_dir(&dir);
+        #[cfg(windows)]
         assert!(recycle("C:\\").is_err(), "a drive root must be rejected");
+        #[cfg(unix)]
+        assert!(recycle("/").is_err(), "a volume root must be rejected");
     }
 }

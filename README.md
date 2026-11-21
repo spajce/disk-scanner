@@ -4,7 +4,7 @@
 
 A native desktop app that shows where the space on a drive went. It reads a volume or a
 folder in one pass and draws the result four ways: a zoomable sunburst, a treemap, a heatmap
-and a sortable details table.
+and a sortable details table. It runs on Windows, macOS and Linux.
 
 ![Disk Scanner](docs/screenshot.png)
 
@@ -16,8 +16,9 @@ and a sortable details table.
 
 Grab the latest `disk-scanner-*-windows-x64.zip` from the
 [releases page](https://github.com/spajce/disk-scanner/releases/latest), unpack it and run
-`disk-scanner.exe`. No installer, nothing else to install; building from source is described
-[below](#building).
+`disk-scanner.exe`. No installer, nothing else to install.
+
+macOS and Linux build from source for now — see [Building](#building).
 
 ## What it does
 
@@ -57,8 +58,8 @@ their folder, single-child chains merged, depth and node count capped — so a v
 millions of files still lays out smoothly.
 
 Sizes are what the disk actually holds: compressed, sparse and cloud placeholder files are
-measured by their allocated size, hard links are counted once, and reparse points are skipped
-so nothing is counted twice.
+measured by their allocated size, hard links are counted once, and symlinks and other reparse
+points are skipped so nothing is counted twice.
 
 ## Layout
 
@@ -74,11 +75,16 @@ scripts/rust-env.ps1             builds through a complete C++ toolchain
 
 ## Building
 
-Requires Rust 1.85+, the MSVC toolchain and the Windows SDK.
+Requires Rust 1.85+ and a C/C++ toolchain:
 
-Run cargo through the environment wrapper. When several C++ toolchains are installed it picks
-a complete one and then starts cargo; with a single, complete toolchain plain `cargo` behaves
-the same.
+- **Windows** — the MSVC toolchain and the Windows SDK.
+- **macOS** — the Xcode command line tools.
+- **Linux** — a C toolchain plus the development packages the window layer needs: X11 or
+  Wayland, xkbcommon, fontconfig/freetype, and the GL/Vulkan drivers.
+
+On Windows, run cargo through the environment wrapper. When several C++ toolchains are
+installed it picks a complete one and then starts cargo; with a single, complete toolchain
+plain `cargo` behaves the same. On macOS and Linux the wrapper is not needed.
 
 ```powershell
 scripts\rust-env.ps1 cargo build --release   # target/release/disk-scanner.exe
@@ -104,6 +110,8 @@ If this tool saves you time, you can support its development.
 
 - Symlinks and every other reparse point are skipped, so nothing is counted twice and a
   junction loop cannot trap the walk.
-- Paths longer than `MAX_PATH` are handled through the `\\?\` form internally.
+- Paths longer than `MAX_PATH` are handled through the `\\?\` form on Windows; elsewhere the
+  operating system has no such limit.
 - Files that vanish or are locked mid-scan are counted as skipped instead of aborting.
-- Deletes go to the Recycle Bin; drive roots are refused.
+- Deletes go wherever the desktop puts them — the Recycle Bin, the Trash, or the freedesktop
+  trash — and volume roots are refused.
