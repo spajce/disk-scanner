@@ -635,7 +635,7 @@ impl DiskApp {
                     Ok(raw) => {
                         let total = raw.size;
                         let dto = to_dto(&raw, total);
-                        let tree = Node::from_dto(&dto);
+                        let tree = Node::from_dto(dto);
                         let cancelled = cancel.load(Ordering::Relaxed);
                         Ok((tree, started.elapsed().as_secs_f64(), cancelled))
                     }
@@ -1980,23 +1980,34 @@ impl DiskApp {
 
         // The canvas measures itself during prepaint; the labels for this
         // frame are laid out from the size measured a moment earlier, so they
-        // line up with the cells painted underneath them.
-        let measured = self
-            .placed
-            .lock()
-            .map(|slot| slot.size)
-            .unwrap_or((0.0, 0.0));
-        let tiles: Arc<Vec<Tile>> = if measured.0 > 1.0 && measured.1 > 1.0 {
-            Arc::new(match view {
+        // line up with the cells painted underneath them. Prepaint already
+        // laid those cells out for this very chart and geometry, so the labels
+        // reuse them rather than running squarify a second time every frame.
+        let mut measured = (0.0, 0.0);
+        let mut cached: Option<Arc<Vec<Tile>>> = None;
+        if let Ok(slot) = self.placed.lock() {
+            measured = slot.size;
+            if measured.0 > 1.0
+                && measured.1 > 1.0
+                && !slot.tiles.is_empty()
+                && slot.describes(view, chart)
+            {
+                cached = Some(slot.tiles.clone());
+            }
+        }
+        let tiles: Arc<Vec<Tile>> = match cached {
+            Some(tiles) => tiles,
+            None if measured.0 > 1.0 && measured.1 > 1.0 => Arc::new(match view {
                 View::Heatmap => heatmap(chart, measured.0, measured.1),
                 _ => treemap(chart, measured.0, measured.1),
-            })
-        } else {
-            if measured != self.tile_size {
-                self.tile_size = measured;
-                window.request_animation_frame();
+            }),
+            None => {
+                if measured != self.tile_size {
+                    self.tile_size = measured;
+                    window.request_animation_frame();
+                }
+                Arc::new(Vec::new())
             }
-            Arc::new(Vec::new())
         };
 
         let mut labels: Vec<AnyElement> = Vec::new();

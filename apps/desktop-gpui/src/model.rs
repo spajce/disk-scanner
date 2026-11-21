@@ -58,19 +58,25 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn from_dto(dto: &NodeDto) -> Arc<Node> {
+    /// Turn the compacted payload into the tree the views paint.
+    ///
+    /// The DTO is taken by value: every name and path moves across instead of
+    /// being cloned again, which halves the allocation done on a volume with
+    /// hundreds of thousands of kept nodes.
+    pub fn from_dto(dto: NodeDto) -> Arc<Node> {
+        let kind = match dto.kind {
+            "dir" => Kind::Dir,
+            "file" => Kind::File,
+            _ => Kind::Other,
+        };
         Arc::new(Node {
-            name: dto.name.clone(),
-            path: dto.path.clone(),
+            name: dto.name,
+            path: dto.path,
             size: dto.size,
             files: dto.files,
             dirs: dto.dirs,
-            kind: match dto.kind {
-                "dir" => Kind::Dir,
-                "file" => Kind::File,
-                _ => Kind::Other,
-            },
-            children: dto.children.iter().map(Node::from_dto).collect(),
+            kind,
+            children: dto.children.into_iter().map(Node::from_dto).collect(),
         })
     }
 

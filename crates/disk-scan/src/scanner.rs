@@ -107,6 +107,9 @@ impl ScanCounters {
 #[derive(Debug)]
 pub struct RawNode {
     pub name: String,
+    /// Full display path. Only the scan root fills this in: every other path is
+    /// rebuilt from its parent while compacting, so a volume with hundreds of
+    /// thousands of folders does not allocate a string per directory.
     pub path: String,
     pub size: u64,
     pub files: u64,
@@ -176,22 +179,71 @@ struct Listing {
     errors: u64,
 }
 
+/// Per-worker scratch space. A system drive has half a million directories,
+/// and a fresh 64 KiB read buffer for each of them would be a lot of `malloc`
+/// traffic on top of the walk itself.
+#[cfg(windows)]
+#[derive(Default)]
+struct Scratch {
+    /// A path as wide characters, prefix already applied, no NUL yet.
+    wide: Vec<u16>,
+}
+
+#[cfg(windows)]
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
+}
+
+/// `C:\x` -> `\\?\C:\x`, and `\\server\share` -> `\\?\UNC\server\share`,
+/// written straight into a reusable wide buffer.
+#[cfg(windows)]
+fn push_verbatim_wide(path: &Path, out: &mut Vec<u16>) {
+    use std::os::windows::ffi::OsStrExt;
+
+    out.clear();
+    let mut units = path.as_os_str().encode_wide();
+    let first = units.next();
+    let second = units.next();
+    if first == Some(b'\\' as u16) && second == Some(b'\\' as u16) {
+        match units.next() {
+            // Already in `\\?\` form.
+            Some(unit) if unit == b'?' as u16 => {
+                out.extend_from_slice(&[b'\\' as u16, b'\\' as u16, b'?' as u16]);
+                out.extend(units);
+            }
+            // A UNC path: the verbatim prefix has to spell out `UNC`.
+            Some(unit) => {
+                out.extend(r"\\?\UNC\".encode_utf16());
+                out.extend_from_slice(&[b'\\' as u16, b'\\' as u16, unit]);
+                out.extend(units);
+            }
+            None => out.extend(r"\\?\".encode_utf16()),
+        }
+    } else {
+        out.extend(r"\\?\".encode_utf16());
+        out.extend(first);
+        out.extend(second);
+        out.extend(units);
+    }
+}
+
 /// `true` when this file's bytes have not been counted yet, `false` when it is
 /// another name for a file already walked. Files with a single link are never
 /// remembered, so the set only ever holds the genuinely shared ones.
 #[cfg(windows)]
-fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> bool {
+fn count_once_path(
+    path: &Path,
+    links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+    wide: &mut Vec<u16>,
+) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE,
         FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
 
-    let wide: Vec<u16> = verbatim(path)
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    push_verbatim_wide(path, wide);
+    wide.push(0);
     // No access rights: the metadata is available from the handle alone.
     let handle = unsafe {
         CreateFileW(
@@ -230,14 +282,11 @@ fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>)
 /// take less, cloud placeholders take almost nothing until they are downloaded.
 /// Unix reports the same number as `st_blocks`, so only Windows needs this.
 #[cfg(windows)]
-fn allocated_size(path: &Path, logical: u64) -> u64 {
+fn allocated_size(path: &Path, logical: u64, wide: &mut Vec<u16>) -> u64 {
     use windows_sys::Win32::Storage::FileSystem::GetCompressedFileSizeW;
 
-    let wide: Vec<u16> = verbatim(path)
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
+    push_verbatim_wide(path, wide);
+    wide.push(0);
     let mut high: u32 = 0;
     let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
     if low == u32::MAX && high == u32::MAX {
@@ -248,22 +297,53 @@ fn allocated_size(path: &Path, logical: u64) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
-/// Read a directory through `FindFirstFileW`, which returns the attributes and
-/// the size together. `std::fs::read_dir` + `DirEntry::metadata` costs a second
-/// syscall per entry, and a system drive has millions of them.
+/// Read a directory through `FindFirstFileExW`.
+///
+/// `FindExInfoBasic` skips the 8.3 short name, which NTFS would otherwise have
+/// to synthesise for every entry, and `FIND_FIRST_EX_LARGE_FETCH` lets the API
+/// pull a bigger batch out of the filesystem per round trip. Together they are
+/// the documented way to make a listing cheaper; `std::fs::read_dir` plus
+/// `DirEntry::metadata` would instead cost a second syscall per entry.
 #[cfg(windows)]
-fn list_dir(dir: &Path) -> Option<Listing> {
+fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> Option<Listing> {
+    let mut scratch = SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    let listing = read_dir_fast(dir, links, &mut scratch);
+    SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
+    listing
+}
+
+#[cfg(windows)]
+fn read_dir_fast(
+    dir: &Path,
+    links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+    scratch: &mut Scratch,
+) -> Option<Listing> {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Storage::FileSystem::{
-        FindClose, FindFirstFileW, FindNextFileW, FILE_ATTRIBUTE_DIRECTORY,
-        WIN32_FIND_DATAW,
+        FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+        FILE_ATTRIBUTE_DIRECTORY, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
     };
 
-    let pattern = format!("{}\\*", verbatim(dir).to_string_lossy());
-    let wide: Vec<u16> = pattern.encode_utf16().chain(std::iter::once(0)).collect();
+    // `\\?\C:\dir\*`: FindFirstFile rejects a trailing backslash, so the
+    // wildcard supplies the last level.
+    push_verbatim_wide(dir, &mut scratch.wide);
+    if !matches!(scratch.wide.last(), Some(unit) if *unit == b'\\' as u16) {
+        scratch.wide.push(b'\\' as u16);
+    }
+    scratch.wide.push(b'*' as u16);
+    scratch.wide.push(0);
 
     let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
-    let handle = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    let handle = unsafe {
+        FindFirstFileExW(
+            scratch.wide.as_ptr(),
+            FindExInfoBasic,
+            std::ptr::addr_of_mut!(data).cast(),
+            FindExSearchNameMatch,
+            std::ptr::null(),
+            FIND_FIRST_EX_LARGE_FETCH,
+        )
+    };
     if handle == INVALID_HANDLE_VALUE {
         return None;
     }
@@ -275,9 +355,10 @@ fn list_dir(dir: &Path) -> Option<Listing> {
         bytes: 0,
         errors: 0,
     };
-    // Reused for every entry of this directory: building a `PathBuf` per file
-    // would allocate millions of times on a system drive, and only the entries
-    // that survive the filters actually need to keep their path.
+    // Rebuilt for each entry that keeps a path — the packed ones, whose size
+    // the volume call needs, and the ones big enough to be drawn. Leaving a
+    // stale path in place would pair this file's size with the previous
+    // *directory*'s name.
     let mut joined = PathBuf::with_capacity(dir.as_os_str().len() + 64);
 
     loop {
@@ -293,9 +374,10 @@ fn list_dir(dir: &Path) -> Option<Listing> {
         if end > 0 && !is_dot && !is_dot_dot {
             let attributes = data.dwFileAttributes;
             if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                // Symlinks, junctions, mount points and dedup stubs are skipped
-                // whole: following them double-counts bytes (`Users\All Users`
-                // -> `ProgramData`) and can walk in circles.
+                // Symlinks, junctions, mount points and dedup stubs are
+                // skipped whole: following them double-counts bytes
+                // (`Users\All Users` -> `ProgramData`) and can walk in
+                // circles.
                 if attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0 {
                     joined.clear();
                     joined.push(dir);
@@ -310,25 +392,29 @@ fn list_dir(dir: &Path) -> Option<Listing> {
                 // Sparse, NTFS-compressed and cloud placeholder files hold less
                 // on the disk than their logical length; ask the volume for the
                 // allocated size of just those, which are rare enough to keep
-                // the extra syscall off the hot path.
+                // the extra call off the hot path.
                 let packed = attributes & TIGHTLY_PACKED_ATTRIBUTES != 0;
-                // Only two kinds of entry keep a path — the packed ones, which
-                // the volume call needs, and the ones big enough to be drawn —
-                // and the buffer is rebuilt for each of them. Leaving a stale
-                // path in place would pair this file's size with the previous
-                // *directory*'s name.
                 if packed || size >= FILE_FLOOR {
                     joined.clear();
                     joined.push(dir);
                     joined.push(OsString::from_wide(name));
                     if packed {
-                        size = allocated_size(&joined, size);
+                        size = allocated_size(&joined, size, &mut scratch.wide);
                     }
                 }
-                listing.files_seen += 1;
-                listing.bytes += size;
-                if size >= FILE_FLOOR {
-                    listing.files.push((size, joined.clone()));
+                // A hard link is the same bytes under two names, so only the
+                // first name counts. Opening a handle costs about as much as
+                // listing a directory, so this only runs for files big enough
+                // for a link to distort the chart — always above FILE_FLOOR, so
+                // the path above exists.
+                let shared =
+                    size >= DEDUPE_FLOOR && !count_once_path(&joined, links, &mut scratch.wide);
+                if !shared {
+                    listing.files_seen += 1;
+                    listing.bytes += size;
+                    if size >= FILE_FLOOR {
+                        listing.files.push((size, joined.clone()));
+                    }
                 }
                 joined.clear();
             }
@@ -349,7 +435,7 @@ fn list_dir(dir: &Path) -> Option<Listing> {
 /// price `du` pays. That buys the on-disk size (`st_blocks`), which is what the
 /// app reports: a sparse file counts the space it occupies, not what it claims.
 #[cfg(unix)]
-fn list_dir(dir: &Path) -> Option<Listing> {
+fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> Option<Listing> {
     use std::os::unix::fs::MetadataExt;
 
     let mut listing = Listing {
@@ -396,6 +482,12 @@ fn list_dir(dir: &Path) -> Option<Listing> {
         // report zero blocks; fall back to the logical length there.
         let allocated = meta.blocks().saturating_mul(512);
         let size = if allocated == 0 { meta.len() } else { allocated };
+        // A hard link is the same bytes under two names, so only the first name
+        // counts. `st_nlink` is in the `stat` already paid for, so this costs
+        // nothing extra here.
+        if size >= DEDUPE_FLOOR && !count_once(&meta, links) {
+            continue;
+        }
         listing.files_seen += 1;
         listing.bytes += size;
         if size >= FILE_FLOOR {
@@ -410,19 +502,17 @@ fn list_dir(dir: &Path) -> Option<Listing> {
 /// another name for a file already walked. `st_nlink` is in the `stat` the walk
 /// already paid for, so a hard link costs the same as any other file here.
 #[cfg(unix)]
-fn count_once(path: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> bool {
+fn count_once(
+    meta: &std::fs::Metadata,
+    links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
 
-    let meta = match std::fs::metadata(path) {
-        Ok(meta) => meta,
-        Err(_) => return true,
-    };
     if meta.nlink() <= 1 {
         return true;
     }
-    let identity = (meta.dev(), meta.ino());
     match links.lock() {
-        Ok(mut set) => set.insert(identity),
+        Ok(mut set) => set.insert((meta.dev(), meta.ino())),
         // A poisoned lock means another thread panicked; keep the bytes rather
         // than silently dropping them from the totals.
         Err(_) => true,
@@ -448,7 +538,15 @@ fn walk(
 ) -> RawNode {
     let mut node = RawNode {
         name: node_name(dir),
-        path: display_path(dir),
+        // Only the root keeps its full path; the rest are rebuilt from their
+        // parent during compaction. A system drive has hundreds of thousands
+        // of directories, and a path string each is a lot of allocation for
+        // something only the kept arcs ever need.
+        path: if depth == 0 {
+            display_path(dir)
+        } else {
+            String::new()
+        },
         size: 0,
         files: 0,
         direct_files: 0,
@@ -473,12 +571,13 @@ fn walk(
     if seen % 32 == 0 {
         if let Ok(mut slot) = counters.current.lock() {
             slot.clear();
-            slot.push_str(&node.path);
+            write_display_path(dir, &mut slot);
         }
     }
 
-    // One `FindFirstFileW` pass gives names, attributes and sizes together.
-    let listing = match list_dir(dir) {
+    // One pass gives names, attributes and sizes together, with hard links
+    // resolved as the entries are read.
+    let listing = match list_dir(dir, &counters.links) {
         Some(listing) => listing,
         None => {
             // Not readable (protected, in use, ...) — skip silently but count it.
@@ -486,24 +585,6 @@ fn walk(
             return node;
         }
     };
-
-    // A hard link is the same bytes under two names, so only the first name
-    // counts. Opening a handle is far too slow for millions of small files, so
-    // this runs only for files big enough to be worth a hard link in the first
-    // place — where a duplicate actually distorts the chart.
-    let mut listing = listing;
-    let mut deduped: u64 = 0;
-    let mut deduped_files: u64 = 0;
-    listing.files.retain(|(size, path)| {
-        if *size < DEDUPE_FLOOR || count_once(path, &counters.links) {
-            return true;
-        }
-        deduped += *size;
-        deduped_files += 1;
-        false
-    });
-    listing.bytes = listing.bytes.saturating_sub(deduped);
-    listing.files_seen = listing.files_seen.saturating_sub(deduped_files);
 
     node.size = listing.bytes;
     node.files = listing.files_seen;
@@ -547,7 +628,7 @@ fn walk(
             .unwrap_or_default();
         children.push(RawNode {
             name,
-            path: display_path(&path),
+            path: String::new(),
             size,
             files: 1,
             direct_files: 1,
@@ -574,15 +655,15 @@ fn walk(
 /// Compact a raw tree into the payload the frontend draws.
 pub fn to_dto(root: &RawNode, total: u64) -> NodeDto {
     let mut budget = NODE_BUDGET;
-    convert(root, total, 0, &mut budget)
+    convert(root, total, 0, &mut budget, "")
 }
 
-fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> NodeDto {
+fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize, parent: &str) -> NodeDto {
     if !node.is_dir {
         *budget = budget.saturating_sub(1);
         return NodeDto {
             name: node.name.clone(),
-            path: node.path.clone(),
+            path: child_path(parent, &node.name),
             size: node.size,
             files: 1,
             dirs: 0,
@@ -592,9 +673,16 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     }
 
     // Collapse `a/b/c` chains: a folder holding a single folder and no file of
-    // its own is just a longer name — drawing it as extra rings is noise.
+    // its own is just a longer name — drawing it as extra rings is noise. The
+    // path follows the chain, so the node still points at the folder the label
+    // actually names.
     let mut current = node;
     let mut name = node.name.clone();
+    let mut path = if parent.is_empty() {
+        node.path.clone()
+    } else {
+        child_path(parent, &node.name)
+    };
     while depth > 0
         && current.direct_files == 0
         && current.children.len() == 1
@@ -604,10 +692,11 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
         current = &current.children[0];
         name.push('/');
         name.push_str(&current.name);
+        path = child_path(&path, &current.name);
     }
 
     let mut kids: Vec<&RawNode> = current.children.iter().collect();
-    kids.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    kids.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 
     let abs_floor = ((total as f64) * ABS_FLOOR).max(1.0) as u64;
     let rel_floor = ((current.size as f64) * REL_FLOOR) as u64;
@@ -643,7 +732,7 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
         let share_of_pool = weight as f64 / left_weight.max(1) as f64;
         let mut share = ((remaining as f64 * share_of_pool) as usize).max(1);
         let granted = share;
-        kept.push(convert(child, total, depth + 1, &mut share));
+        kept.push(convert(child, total, depth + 1, &mut share, &path));
         remaining = remaining.saturating_sub(granted.saturating_sub(share));
         left_weight = left_weight.saturating_sub(weight);
     }
@@ -687,11 +776,11 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
         }
     }
 
-    kept.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+    kept.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 
     NodeDto {
         name,
-        path: current.path.clone(),
+        path,
         size: shown_size,
         files: current.files,
         dirs: current.dirs,
@@ -700,29 +789,41 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize) -> Node
     }
 }
 
-/// `C:\` -> `\\?\C:\` so paths beyond MAX_PATH still work.
-#[cfg(windows)]
-fn verbatim(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if text.starts_with(r"\\?\") {
-        return path.to_path_buf();
-    }
-    if let Some(rest) = text.strip_prefix(r"\\") {
-        return PathBuf::from(format!(r"\\?\UNC\{}", rest));
-    }
-    PathBuf::from(format!(r"\\?\{}", text))
+/// Inverse of [`push_verbatim_wide`], for display and for the filesystem calls
+/// that take a path back.
+fn display_path(path: &Path) -> String {
+    let mut out = String::new();
+    write_display_path(path, &mut out);
+    out
 }
 
-/// Inverse of [`verbatim`], for display and for the webview.
-fn display_path(path: &Path) -> String {
-    let text = path.to_string_lossy().into_owned();
+/// [`display_path`] into a buffer the caller already owns, so the progress
+/// readout can be rewritten without a throwaway string.
+fn write_display_path(path: &Path, out: &mut String) {
+    let text = path.to_string_lossy();
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{}", rest)
+        out.push_str(r"\\");
+        out.push_str(rest);
     } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        rest.to_string()
+        out.push_str(rest);
     } else {
-        text
+        out.push_str(&text);
     }
+}
+
+/// One path level down, using the platform's separator. A root such as `C:\`
+/// already ends in one, so it must not be doubled.
+fn child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(parent.len() + name.len() + 1);
+    out.push_str(parent);
+    if !out.ends_with(std::path::MAIN_SEPARATOR) {
+        out.push(std::path::MAIN_SEPARATOR);
+    }
+    out.push_str(name);
+    out
 }
 
 fn node_name(path: &Path) -> String {
@@ -873,7 +974,8 @@ mod tests {
         tree.file("payload.bin", FILE_FLOOR as usize);
 
         let raw = scan_tree(&tree.0);
-        for child in &raw.children {
+        let dto = to_dto(&raw, raw.size);
+        for child in &dto.children {
             let last = child
                 .path
                 .rsplit(std::path::MAIN_SEPARATOR)
@@ -881,13 +983,13 @@ mod tests {
                 .unwrap_or_default();
             assert_eq!(
                 child.name, last,
-                "a node's name must come from its own path, not a neighbour's"
+                "a node's path must be built from its own name, not a neighbour's"
             );
         }
         assert!(
-            raw.children
+            dto.children
                 .iter()
-                .any(|child| !child.is_dir && child.name == "payload.bin"),
+                .any(|child| child.kind == "file" && child.name == "payload.bin"),
             "the file big enough to draw keeps its own name"
         );
     }

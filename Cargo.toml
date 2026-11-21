@@ -13,7 +13,11 @@ xattr = { path = "vendor/xattr" }
 [profile.release]
 lto = true
 codegen-units = 1
-opt-level = "s"
+# The walk is syscall-bound, but the tree compaction and the chart layout are
+# not: squarify, the sunburst geometry and the payload conversion all run per
+# scan (and per frame, for the layout), so trade a few hundred KB of binary for
+# the machine code that does the arithmetic.
+opt-level = 3
 strip = true
 
 # The walker is unusable at opt-level 0 (megabytes per second); keep the
