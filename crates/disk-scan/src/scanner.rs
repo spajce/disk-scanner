@@ -774,6 +774,28 @@ mod tests {
         scan(path, &AtomicBool::new(false), &ScanCounters::new()).unwrap()
     }
 
+    /// What the walk is expected to report for one file: the space it takes on
+    /// the volume. That is the logical length on Windows (NTFS reports it
+    /// exactly) and the allocated block count on Unix, so a fixture of exact
+    /// lengths does not add up to those lengths there.
+    #[cfg(unix)]
+    fn on_disk(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+
+        let meta = fs::metadata(path).expect("fixture file");
+        let allocated = meta.blocks().saturating_mul(512);
+        if allocated == 0 {
+            meta.len()
+        } else {
+            allocated
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn on_disk(path: &Path) -> u64 {
+        fs::metadata(path).expect("fixture file").len()
+    }
+
     #[test]
     fn a_paused_walk_holds_its_counters_and_resumes() {
         let tree = TempTree::new("pause");
@@ -801,7 +823,9 @@ mod tests {
             );
 
             pause.store(false, Ordering::Relaxed);
-            assert_eq!(walk.join().unwrap(), 3072);
+            let expected = on_disk(&tree.0.join("a.bin"))
+                + on_disk(&tree.0.join("sub").join("b.bin"));
+            assert_eq!(walk.join().unwrap(), expected);
         });
     }
 
@@ -812,8 +836,11 @@ mod tests {
         tree.file("sub/b.bin", 2048);
         tree.file("sub/deep/c.bin", 4096);
 
+        let expected = on_disk(&tree.0.join("a.bin"))
+            + on_disk(&tree.0.join("sub").join("b.bin"))
+            + on_disk(&tree.0.join("sub").join("deep").join("c.bin"));
         let raw = scan_tree(&tree.0);
-        assert_eq!(raw.size, 7168);
+        assert_eq!(raw.size, expected);
         assert_eq!(raw.files, 3);
         assert_eq!(raw.dirs, 2);
     }
@@ -825,8 +852,11 @@ mod tests {
         tree.file("sub/huge.bin", 512 * 1024);
         tree.file("sub/tiny.bin", 32);
 
+        let expected = on_disk(&tree.0.join("big.bin"))
+            + on_disk(&tree.0.join("sub").join("huge.bin"))
+            + on_disk(&tree.0.join("sub").join("tiny.bin"));
         let raw = scan_tree(&tree.0);
-        assert_eq!(raw.size, 768 * 1024 + 32, "bytes must be counted once");
+        assert_eq!(raw.size, expected, "bytes must be counted once");
         assert_eq!(raw.files, 3, "files must be counted once");
 
         let dto = to_dto(&raw, raw.size);

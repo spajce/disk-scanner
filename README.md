@@ -71,6 +71,7 @@ apps/desktop-gpui/src/sys.rs     shell integration, theme probe, file dates
 crates/disk-scan/src/scanner.rs  parallel walk and tree compaction
 crates/disk-scan/src/drives.rs   volume enumeration
 scripts/rust-env.ps1             builds through a complete C++ toolchain
+vendor/xattr/                    one-crate patch, see the note in Cargo.toml
 ```
 
 ## Building

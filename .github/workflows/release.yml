@@ -78,7 +78,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage, dist | Out-Null
           Copy-Item target/release/disk-scanner.exe $stage/
           Copy-Item README.md $stage/
-          Compress-Archive -Path "$stage/*" -DestinationPath "dist/disk-scanner-$tag-${{ matrix.package }}.zip"
+          Compress-Archive -Path $stage -DestinationPath "dist/disk-scanner-$tag-${{ matrix.package }}.zip"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -125,8 +125,9 @@ jobs:
             No installer and no runtime to download; the only requirement is the Microsoft
             Visual C++ Redistributable (already present on virtually every Windows install).
 
-            **macOS** — unpack `disk-scanner-*-macos-arm64.tar.gz` and run `disk-scanner`.
-            The binary is not notarised, so the first launch needs *right-click → Open*.
+            **macOS (Apple silicon)** — unpack `disk-scanner-*-macos-arm64.tar.gz` and run
+            `disk-scanner`. The binary is not notarised, so the first launch needs
+            *right-click → Open*; Intel Macs can build from source.
 
             **Linux** — unpack `disk-scanner-*-linux-x64.tar.gz` and run `./disk-scanner`.
             The X11/Wayland, font and GL runtime libraries come from the distribution.
