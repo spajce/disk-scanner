@@ -615,6 +615,9 @@ fn timestamp_utc() -> String {
 
 #[cfg(test)]
 mod tests {
+    // The only test here drives the trash, which macOS hands to Finder, so on
+    // that target the module is empty and nothing needs importing.
+    #[cfg(not(target_os = "macos"))]
     use super::*;
 
     // macOS asks Finder to do the move, which needs an interactive session, so

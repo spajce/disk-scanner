@@ -3885,18 +3885,29 @@ mod tests {
 
     #[test]
     fn climbs_past_folded_chain_nodes_to_the_nearest_real_ancestor() {
-        // The scanner folds `app.asar.unpacked\dsh\node_modules` into one node,
+        // The scanner folds `app.asar.unpacked/dsh/node_modules` into one node,
         // and the same prefix also exists as a small file beside it, so path
         // arithmetic resolves to the wrong node. "Up" must follow the rings.
+        let sep = std::path::MAIN_SEPARATOR;
+        let root_path = if cfg!(windows) {
+            "C:\\".to_string()
+        } else {
+            "/".to_string()
+        };
+        let app_path = format!("{root_path}App");
+        let resources_path = format!("{app_path}{sep}resources");
+        let loose_path = format!("{resources_path}{sep}app.asar.unpacked");
+        let chain_path = format!("{loose_path}{sep}dsh{sep}node_modules");
+
         let chain = folder(
-            r"app.asar.unpacked\dsh\node_modules",
-            r"C:\App\resources\app.asar.unpacked\dsh\node_modules",
+            &format!("app.asar.unpacked{sep}dsh{sep}node_modules"),
+            &chain_path,
             300,
             Vec::new(),
         );
         let loose_file = Arc::new(Node {
             name: "app.asar.unpacked".to_string(),
-            path: r"C:\App\resources\app.asar.unpacked".to_string(),
+            path: loose_path.clone(),
             size: 1,
             files: 1,
             dirs: 0,
@@ -3905,31 +3916,35 @@ mod tests {
         });
         let resources = folder(
             "resources",
-            r"C:\App\resources",
+            &resources_path,
             400,
             vec![chain.clone(), loose_file],
         );
-        let app = folder("App", r"C:\App", 500, vec![resources.clone()]);
-        let root = folder("C:\\", r"C:\", 500, vec![app.clone()]);
+        let app = folder("App", &app_path, 500, vec![resources.clone()]);
+        let root = folder("root", &root_path, 500, vec![app.clone()]);
 
         assert_eq!(
-            parent_of(&root, &chain.path).expect("a ring above the chain").path,
-            r"C:\App\resources"
+            parent_of(&root, &chain.path)
+                .expect("a ring above the chain")
+                .path,
+            resources_path
         );
         assert_eq!(
-            parent_of(&root, &resources.path).expect("a ring above resources").path,
-            r"C:\App"
+            parent_of(&root, &resources.path)
+                .expect("a ring above resources")
+                .path,
+            app_path
         );
         assert_eq!(
             parent_of(&root, &app.path).expect("a ring above App").path,
-            r"C:\"
+            root_path
         );
         assert!(parent_of(&root, &root.path).is_none());
 
         // A breadcrumb segment pointing at the middle of the chain still lands
         // on the deepest node that lives under it.
         assert_eq!(
-            deepest_inside(&root, r"C:\App\resources\app.asar.unpacked")
+            deepest_inside(&root, &loose_path)
                 .expect("the chain below the segment")
                 .path,
             chain.path

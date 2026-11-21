@@ -3,6 +3,13 @@ resolver = "2"
 members = ["apps/desktop-gpui", "crates/disk-scan"]
 exclude = ["src-tauri"]
 
+# The window layer pulls in an old `xattr` through its tar reader, and that
+# release refers to `libc::ENOATTR`, which libc no longer defines on Linux.
+# The vendored copy is the same crate with that one constant mapped to
+# `ENODATA` there, so Linux builds compile; every other platform is unchanged.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
+
 [profile.release]
 lto = true
 codegen-units = 1
