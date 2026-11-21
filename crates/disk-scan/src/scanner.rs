@@ -179,6 +179,19 @@ struct Listing {
     errors: u64,
 }
 
+impl Listing {
+    /// A listing of a readable directory with nothing in it.
+    fn empty() -> Self {
+        Listing {
+            subdirs: Vec::new(),
+            files: Vec::new(),
+            files_seen: 0,
+            bytes: 0,
+            errors: 0,
+        }
+    }
+}
+
 /// Per-worker scratch space. A system drive has half a million directories,
 /// and a fresh 64 KiB read buffer for each of them would be a lot of `malloc`
 /// traffic on top of the walk itself.
@@ -318,7 +331,9 @@ fn read_dir_fast(
     links: &Mutex<std::collections::HashSet<(u64, u64)>>,
     scratch: &mut Scratch,
 ) -> Option<Listing> {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Foundation::{
+        GetLastError, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
         FILE_ATTRIBUTE_DIRECTORY, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
@@ -345,16 +360,18 @@ fn read_dir_fast(
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        return None;
+        // `FindFirstFile` reports an empty directory as a failure, so without
+        // this check every empty folder would be counted as one the walk could
+        // not read.
+        let error = unsafe { GetLastError() };
+        return if error == ERROR_FILE_NOT_FOUND || error == ERROR_NO_MORE_FILES {
+            Some(Listing::empty())
+        } else {
+            None
+        };
     }
 
-    let mut listing = Listing {
-        subdirs: Vec::new(),
-        files: Vec::new(),
-        files_seen: 0,
-        bytes: 0,
-        errors: 0,
-    };
+    let mut listing = Listing::empty();
     // Rebuilt for each entry that keeps a path — the packed ones, whose size
     // the volume call needs, and the ones big enough to be drawn. Leaving a
     // stale path in place would pair this file's size with the previous
@@ -438,13 +455,7 @@ fn read_dir_fast(
 fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> Option<Listing> {
     use std::os::unix::fs::MetadataExt;
 
-    let mut listing = Listing {
-        subdirs: Vec::new(),
-        files: Vec::new(),
-        files_seen: 0,
-        bytes: 0,
-        errors: 0,
-    };
+    let mut listing = Listing::empty();
 
     for entry in std::fs::read_dir(dir).ok()? {
         let entry = match entry {
@@ -944,6 +955,24 @@ mod tests {
         assert_eq!(raw.size, expected);
         assert_eq!(raw.files, 3);
         assert_eq!(raw.dirs, 2);
+    }
+
+    #[test]
+    fn an_empty_folder_is_not_an_error() {
+        let tree = TempTree::new("empty");
+        fs::create_dir_all(tree.0.join("vacant")).unwrap();
+
+        let counters = ScanCounters::new();
+        let raw = scan(&tree.0, &AtomicBool::new(false), &counters).unwrap();
+
+        assert_eq!(raw.size, 0);
+        assert_eq!(raw.files, 0);
+        assert_eq!(raw.children.len(), 1, "the folder stays in the tree");
+        assert_eq!(
+            counters.errors.load(Ordering::Relaxed),
+            0,
+            "an empty folder is readable, just empty"
+        );
     }
 
     #[test]
