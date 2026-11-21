@@ -14,11 +14,17 @@ and a sortable details table. It runs on Windows, macOS and Linux.
 
 ## Download
 
-Grab the latest `disk-scanner-*-windows-x64.zip` from the
+Grab the archive for your platform from the
 [releases page](https://github.com/spajce/disk-scanner/releases/latest), unpack it and run
-`disk-scanner.exe`. No installer, nothing else to install.
+the `disk-scanner` binary inside. No installer and nothing else to install.
 
-macOS and Linux build from source for now — see [Building](#building).
+| Platform | Archive | Note |
+| --- | --- | --- |
+| Windows | `disk-scanner-*-windows-x64.zip` | run `disk-scanner.exe` |
+| macOS (Apple silicon) | `disk-scanner-*-macos-arm64.tar.gz` | not notarised: first launch needs *right-click → Open* |
+| Linux | `disk-scanner-*-linux-x64.tar.gz` | needs the distribution's X11/Wayland, font and GL libraries, which a desktop install already has |
+
+Building from source — including Intel Macs — is described [below](#building).
 
 ## What it does
 
