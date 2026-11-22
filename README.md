@@ -101,6 +101,9 @@ scripts\rust-env.ps1 cargo test
 
 The app remembers the last scanned folder in `%APPDATA%\disk-scanner\last-root.txt` and
 rescans it on start. A volume already walked in this session repaints instantly from memory.
+A finished walk is also written to `%APPDATA%\disk-scanner\snapshots`, so the first frame of
+the next run draws the previous tree instead of waiting for the walk to finish; the newest
+four snapshots are kept and the walk refreshes them behind the window.
 
 For reference, a full `C:\` walk here (3.25 M files, 532 K folders) takes about 7 s with the
 parallel walker and about 22 s single-threaded.

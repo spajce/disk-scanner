@@ -27,3 +27,9 @@ opt-level = 2
 
 [profile.dev.package.rayon-core]
 opt-level = 2
+
+# The chart layout and the paint closures are arithmetic over thousands of
+# slices per frame. Unoptimised they make a debug build feel like a different
+# program, so optimise this crate while leaving dependencies debuggable.
+[profile.dev.package.desktop-gpui]
+opt-level = 2
