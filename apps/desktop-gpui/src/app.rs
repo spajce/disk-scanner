@@ -9,14 +9,14 @@ use std::time::{Duration, Instant, SystemTime};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, linear_color_stop, linear_gradient, point, px, quad, size,
+    canvas, div, linear_color_stop, linear_gradient, point, px, quad, relative, size,
     AnyElement, App, BorderStyle, Bounds,
     Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, Render, SharedString, Window,
     WindowOptions,
 };
 
-use disk_scan::{list_drives, scan_pausable, to_dto, DriveInfo, ScanCounters};
+use disk_scan::{list_drives, scan_pausable, to_dto, DriveInfo, ScanCounters, ScanMeta};
 
 use crate::model::{
     build_chart, heatmap, hit, log_rank, short_name, treemap, ChartModel, Geom, Kind, Metric, Node,
@@ -198,7 +198,9 @@ impl Placed {
 struct Cached {
     tree: Arc<Node>,
     elapsed: f64,
-    at: Instant,
+    /// Wall-clock time of the walk, so an entry restored from disk can say how
+    /// old it is as well as one from earlier in this session.
+    at: SystemTime,
 }
 
 pub struct DiskApp {
@@ -265,6 +267,25 @@ impl DiskApp {
         let theme_mode = load_theme_mode().unwrap_or(theme::Mode::System);
         let system_dark = !crate::sys::system_prefers_light();
         theme::apply(theme_mode, system_dark);
+
+        // A finished scan left by an earlier session is installed as if it had
+        // been walked a moment ago: `scan_into` paints from this map before the
+        // walker has done anything, and the walk then refreshes the numbers in
+        // place. On a spinning disk that is the difference between a window that
+        // draws at once and one that sits blank for minutes.
+        let mut cache = HashMap::new();
+        if let Some(dir) = snapshot_dir() {
+            if let Some(snapshot) = disk_scan::cache::load(&dir, &last_root) {
+                cache.insert(
+                    cache_key(&last_root),
+                    Cached {
+                        tree: Node::from_dto(snapshot.tree),
+                        elapsed: snapshot.meta.elapsed,
+                        at: snapshot.meta.scanned_at,
+                    },
+                );
+            }
+        }
         let mut app = DiskApp {
             drives,
             tree: None,
@@ -283,7 +304,7 @@ impl DiskApp {
             last_root: last_root.clone(),
             note: None,
             focus_handle: cx.focus_handle(),
-            cache: HashMap::new(),
+            cache,
             theme_mode,
             system_dark,
             view: initial_view(),
@@ -447,7 +468,7 @@ impl DiskApp {
                 save_last_root(&root);
                 self.note = Some(format!(
                     "Showing the scan from {} ago — Rescan to refresh",
-                    theme::format_seconds(cached_at.elapsed().as_secs_f64())
+                    theme::format_seconds(age_seconds(cached_at))
                 ));
                 cx.notify();
                 return;
@@ -625,19 +646,42 @@ impl DiskApp {
         })
         .detach();
 
-        // The walk itself runs on a background thread; the DTO conversion and
-        // the Arc tree are built there too.
+        // The walk itself runs on a background thread; the DTO conversion, the
+        // snapshot and the Arc tree are built there too.
         let walk_root = target.clone();
+        let snapshot_dir = snapshot_dir();
         cx.spawn(async move |this, cx| {
             let work = cx.background_spawn(async move {
                 let started = Instant::now();
                 match scan_pausable(Path::new(&walk_root), &cancel, &pause, &counters) {
                     Ok(raw) => {
                         let total = raw.size;
+                        let elapsed = started.elapsed().as_secs_f64();
                         let dto = to_dto(&raw, total);
+                        // A full, finished walk is what a start-up restores, so
+                        // it is worth writing down; a folder refresh only
+                        // replaces part of a tree and is left to the next walk.
+                        // A superseded walk is not worth keeping either.
+                        if !subtree && !cancel.load(Ordering::Relaxed) {
+                            if let Some(dir) = &snapshot_dir {
+                                let (files, dirs, bytes, errors, _) = counters.snapshot();
+                                let meta = ScanMeta {
+                                    root: walk_root.clone(),
+                                    scanned_at: SystemTime::now(),
+                                    elapsed,
+                                    files,
+                                    dirs,
+                                    bytes,
+                                    errors,
+                                };
+                                // A cache write that fails must not fail the
+                                // scan: the tree is already in hand.
+                                let _ = disk_scan::cache::save(dir, &meta, &dto);
+                            }
+                        }
                         let tree = Node::from_dto(dto);
                         let cancelled = cancel.load(Ordering::Relaxed);
-                        Ok((tree, started.elapsed().as_secs_f64(), cancelled))
+                        Ok((tree, elapsed, cancelled))
                     }
                     Err(error) => Err(error),
                 }
@@ -718,7 +762,7 @@ impl DiskApp {
                             Cached {
                                 tree: merged.clone(),
                                 elapsed,
-                                at: Instant::now(),
+                                at: SystemTime::now(),
                             },
                         );
                         self.tree = Some(merged);
@@ -744,7 +788,7 @@ impl DiskApp {
                     Cached {
                         tree: tree.clone(),
                         elapsed,
-                        at: Instant::now(),
+                        at: SystemTime::now(),
                     },
                 );
                 self.tree = Some(tree);
@@ -1022,18 +1066,14 @@ impl DiskApp {
     /// chain. Both are click targets, so the pane doubles as navigation — and it
     /// is the same pane in every view.
     fn detail_nav(&self, focus: &Arc<Node>, cx: &mut Context<Self>) -> Div {
+        // The rows inside the pane scroll both ways: a deep folder chain is
+        // indented past the right edge, and a machine with several volumes runs
+        // past the bottom. Neither should be cut off.
         let mut pane = div()
-            .w(px(NAV_W))
-            .flex_shrink_0()
             .flex()
             .flex_col()
             .gap(px(2.0))
             .p(px(8.0))
-            .rounded(px(10.0))
-            .bg(theme::surface())
-            .border_1()
-            .border_color(theme::hairline())
-            .text_size(px(11.5))
             .child(section_label("THIS PC"));
 
         let active_root = self.active_drive().map(|drive| drive.root.clone());
@@ -1076,7 +1116,7 @@ impl DiskApp {
                             .items_center()
                             .gap(px(6.0))
                             .child(div().text_size(px(11.0)).child("💾"))
-                            .child(div().flex_1().min_w_0().truncate().child(title)),
+                            .child(div().flex_shrink_0().whitespace_nowrap().child(title)),
                     )
                     .child(
                         div()
@@ -1093,14 +1133,17 @@ impl DiskApp {
                                     } else {
                                         theme::accent()
                                     })
-                                    .w(px((NAV_W - 26.0) * fraction)),
+                                    // A fraction of the row rather than a fixed
+                                    // width, so the bar stays honest when a
+                                    // long name has widened the pane.
+                                    .w(relative(fraction)),
                             ),
                     )
                     .child(
                         div()
                             .text_size(px(9.5))
                             .text_color(theme::text_faint())
-                            .truncate()
+                            .whitespace_nowrap()
                             .child(usage),
                     ),
             );
@@ -1147,10 +1190,36 @@ impl DiskApp {
                             .opacity(0.6)
                             .child(if current { "▸" } else { "·" }),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(label)),
+                    .child(div().flex_shrink_0().whitespace_nowrap().child(label)),
             );
         }
-        pane
+
+        // The frame stays the width the layout reserves; only its contents move.
+        div()
+            .w(px(NAV_W))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .text_size(px(11.5))
+            .overflow_hidden()
+            .child(
+                // A row, with the content sized to what it needs rather than
+                // stretched: the scroll extent is measured from this child's
+                // own box, so it has to be allowed to grow past the frame.
+                div()
+                    .id("nav-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .overflow_scroll()
+                    .child(pane.flex_shrink_0().min_w(px(NAV_W - 2.0))),
+            )
     }
 
     /// The table itself: the folder's own toolbar, the column header, the
@@ -3583,6 +3652,20 @@ fn config_dir() -> Option<std::path::PathBuf> {
 
 fn last_root_path() -> Option<std::path::PathBuf> {
     Some(config_dir()?.join("last-root.txt"))
+}
+
+/// Where finished scans are kept on disk, so a start-up can draw the last tree
+/// before the walker has read a directory.
+fn snapshot_dir() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("snapshots"))
+}
+
+/// Age of a cache entry in seconds, for the "from … ago" note.
+fn age_seconds(at: SystemTime) -> f64 {
+    SystemTime::now()
+        .duration_since(at)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn load_last_root() -> Option<String> {
