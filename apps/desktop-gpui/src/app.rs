@@ -12,8 +12,8 @@ use gpui::{
     canvas, div, linear_color_stop, linear_gradient, point, px, quad, relative, size,
     AnyElement, App, BorderStyle, Bounds,
     Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, PathBuilder, Pixels, Point, Render, SharedString, Window,
-    WindowOptions,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollHandle,
+    SharedString, Window, WindowOptions,
 };
 
 use disk_scan::{list_drives, scan_pausable, to_dto, DriveInfo, ScanCounters, ScanMeta};
@@ -100,6 +100,15 @@ const DETAIL_HEADER_H: f32 = 26.0;
 // folder's chain. `NAV_W` is its width, gap included, when a view reserves room
 // for it.
 const NAV_W: f32 = 226.0;
+/// One folder per row in the navigation tree.
+const NAV_ROW_H: f32 = 18.0;
+/// Indentation added per level of the navigation tree.
+const NAV_INDENT: f32 = 11.0;
+/// Rows the navigation tree will lay out. Expanding a few 500-entry folders
+/// would otherwise put tens of thousands of elements in one frame.
+const MAX_NAV_ROWS: usize = 2000;
+/// Thickness of a scrollbar and the gap it keeps from the frame edge.
+const NAV_BAR: f32 = 5.0;
 const COL_SIZE: f32 = 92.0;
 const COL_FILES: f32 = 70.0;
 const COL_FOLDERS: f32 = 70.0;
@@ -203,6 +212,25 @@ struct Cached {
     at: SystemTime,
 }
 
+/// One row of the navigation tree: a folder, how deep it sits, and whether its
+/// children are showing.
+struct NavRow {
+    node: Arc<Node>,
+    depth: usize,
+    expanded: bool,
+    has_children: bool,
+}
+
+/// A navigation scrollbar being dragged.
+#[derive(Clone, Copy)]
+struct NavDrag {
+    vertical: bool,
+    /// Pointer position along the bar's axis when the drag started.
+    origin: f32,
+    /// Scroll progress (0 at the top/left, 1 at the end) when it started.
+    progress: f32,
+}
+
 pub struct DiskApp {
     drives: Vec<DriveInfo>,
     tree: Option<Arc<Node>>,
@@ -239,6 +267,18 @@ pub struct DiskApp {
     /// second press inside the double-click window opens the folder.
     detail_selected: Option<String>,
     detail_clicked: Option<(String, Instant)>,
+    /// Folder tree in the navigation pane: the folders that are open, keyed
+    /// like the scan cache so a path compares the same way everywhere.
+    nav_expanded: HashSet<String>,
+    /// Where that tree is scrolled to, shared with its scrollbars.
+    nav_scroll: ScrollHandle,
+    /// Logical size of the tree's viewport, measured during paint.
+    nav_size: (f32, f32),
+    /// The folder the tree was last opened up for, so closing a folder the
+    /// chart is inside stays closed instead of being re-opened every frame.
+    nav_revealed_for: Option<String>,
+    /// A scrollbar being dragged, with where it started.
+    nav_drag: Option<NavDrag>,
     /// Modification dates for the rows on screen, collected on a worker thread.
     detail_meta: Arc<Mutex<HashMap<String, DetailMeta>>>,
     /// Folder whose dates have already been requested, so a frame never starts
@@ -313,6 +353,11 @@ impl DiskApp {
             detail_sort: DetailSort::default(),
             detail_selected: None,
             detail_clicked: None,
+            nav_expanded: HashSet::new(),
+            nav_scroll: ScrollHandle::new(),
+            nav_size: (-1.0, -1.0),
+            nav_revealed_for: None,
+            nav_drag: None,
             detail_meta: Arc::new(Mutex::new(HashMap::new())),
             detail_meta_for: None,
         };
@@ -393,14 +438,16 @@ impl DiskApp {
         }
         if let Some(node) = candidates
             .iter()
-            .find_map(|candidate| Node::find(&tree, candidate))
+            .find_map(|candidate| find_dir(&tree, candidate))
         {
             self.set_focus(node, cx);
             return;
         }
-        // A breadcrumb segment can name the middle of a folded chain, where the
-        // only real node is the chain itself (`a\b\c`).
-        if let Some(node) = deepest_inside(&tree, &path) {
+        // A segment can name the middle of a folder chain the scanner folded
+        // into one node (`a\b\c`). The node that *represents* that segment is
+        // the nearest one below it, not the deepest: the nearest is the chain
+        // itself, and opening it shows the chain's own children.
+        if let Some(node) = nearest_below(&tree, &path) {
             self.set_focus(node, cx);
             return;
         }
@@ -408,6 +455,128 @@ impl DiskApp {
             self.switch_to(path, cx);
         } else {
             self.note = Some(format!("{} is not in this scan", short_name(&path, 44)));
+            cx.notify();
+        }
+    }
+
+    /// Open every folder above `path`, plus the root, so the tree shows where
+    /// the chart currently is. Called every frame, so a scan, a chart click or a
+    /// shortcut all keep the tree in step without any bookkeeping at the call
+    /// sites.
+    fn reveal_in_nav(&mut self, path: &str) {
+        let Some(tree) = self.tree.clone() else { return };
+        reveal_path(&tree, path, &mut self.nav_expanded);
+    }
+
+    /// Open or close one folder's children in the navigation tree.
+    fn toggle_nav(&mut self, path: &str, cx: &mut Context<Self>) {
+        let key = cache_key(path);
+        if !self.nav_expanded.remove(&key) {
+            self.nav_expanded.insert(key);
+        }
+        cx.notify();
+    }
+
+    /// The visible rows of the navigation tree: the root, then the children of
+    /// every folder that is open.
+    fn nav_rows(&self) -> Vec<NavRow> {
+        let Some(tree) = self.tree.as_ref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        push_nav_rows(tree, 0, &self.nav_expanded, &mut rows);
+        rows
+    }
+
+    /// Thumb length and track length for one scrollbar, or `None` when that
+    /// axis has nothing to scroll.
+    fn nav_bar(&self, vertical: bool) -> Option<(f32, f32)> {
+        let max = self.nav_scroll.max_offset();
+        let hidden = if vertical {
+            f32::from(max.height)
+        } else {
+            f32::from(max.width)
+        };
+        let viewport = if vertical {
+            self.nav_size.1
+        } else {
+            self.nav_size.0
+        };
+        if viewport <= 1.0 || hidden <= 0.5 {
+            return None;
+        }
+        let track = (viewport - NAV_BAR * 2.0).max(1.0);
+        let thumb = (track * viewport / (viewport + hidden)).clamp(track.min(20.0), track);
+        Some((thumb, track))
+    }
+
+    /// How far down (0 to 1) one axis is scrolled.
+    fn nav_progress(&self, vertical: bool) -> f32 {
+        let max = self.nav_scroll.max_offset();
+        let offset = self.nav_scroll.offset();
+        let (hidden, at) = if vertical {
+            (f32::from(max.height), -f32::from(offset.y))
+        } else {
+            (f32::from(max.width), -f32::from(offset.x))
+        };
+        if hidden <= 0.0 {
+            return 0.0;
+        }
+        (at / hidden).clamp(0.0, 1.0)
+    }
+
+    fn begin_nav_drag(&mut self, vertical: bool, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let origin = if vertical {
+            f32::from(event.position.y)
+        } else {
+            f32::from(event.position.x)
+        };
+        self.nav_drag = Some(NavDrag {
+            vertical,
+            origin,
+            progress: self.nav_progress(vertical),
+        });
+        cx.stop_propagation();
+    }
+
+    /// Follow a navigation scrollbar that is being dragged.
+    fn drag_nav(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.nav_drag else { return };
+        if event.pressed_button.is_none() {
+            self.nav_drag = None;
+            return;
+        }
+        let Some((thumb, track)) = self.nav_bar(drag.vertical) else {
+            return;
+        };
+        let position = if drag.vertical {
+            f32::from(event.position.y)
+        } else {
+            f32::from(event.position.x)
+        };
+        // Moving the pointer over the free part of the track moves the thumb
+        // the same distance, which is the whole content when dragged end to end.
+        let range = track - thumb;
+        if range <= 0.0 {
+            return;
+        }
+        let progress = (drag.progress + (position - drag.origin) / range).clamp(0.0, 1.0);
+
+        let max = self.nav_scroll.max_offset();
+        let current = self.nav_scroll.offset();
+        let moved = if drag.vertical {
+            let hidden = f32::from(max.height);
+            point(current.x, px(-(progress * hidden)))
+        } else {
+            let hidden = f32::from(max.width);
+            point(px(-(progress * hidden)), current.y)
+        };
+        self.nav_scroll.set_offset(moved);
+        cx.notify();
+    }
+
+    fn end_nav_drag(&mut self, cx: &mut Context<Self>) {
+        if self.nav_drag.take().is_some() {
             cx.notify();
         }
     }
@@ -1065,7 +1234,29 @@ impl DiskApp {
     /// The left column: the volumes, then where the open folder sits in its own
     /// chain. Both are click targets, so the pane doubles as navigation — and it
     /// is the same pane in every view.
-    fn detail_nav(&self, focus: &Arc<Node>, cx: &mut Context<Self>) -> Div {
+    fn detail_nav(
+        &mut self,
+        focus: &Arc<Node>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // Whatever moved the chart — a click, a shortcut, a finished scan — the
+        // tree opens the folders above it and follows along. Only on a change:
+        // re-revealing every frame would re-open a folder the user just closed.
+        let focus_path = focus.path.clone();
+        if self.nav_revealed_for.as_deref() != Some(focus_path.as_str()) {
+            self.nav_revealed_for = Some(focus_path.clone());
+            self.reveal_in_nav(&focus_path);
+        }
+        // The bars are drawn from the measured viewport, which only exists after
+        // the first layout: ask for one more frame when it changes.
+        let size = self.nav_scroll.bounds().size;
+        let measured = (f32::from(size.width), f32::from(size.height));
+        if measured != self.nav_size {
+            self.nav_size = measured;
+            window.request_animation_frame();
+        }
+
         // The rows inside the pane scroll both ways: a deep folder chain is
         // indented past the right edge, and a machine with several volumes runs
         // past the bottom. Neither should be cut off.
@@ -1149,55 +1340,106 @@ impl DiskApp {
             );
         }
 
-        pane = pane.child(
-            div()
-                .mt(px(8.0))
-                .child(section_label("CURRENT FOLDER")),
-        );
-        let segments = breadcrumb_segments(&focus.path);
-        let last = segments.len().saturating_sub(1);
-        for (index, (label, full)) in segments.into_iter().enumerate() {
-            let current = index == last;
-            let target = full;
+        pane = pane.child(div().mt(px(8.0)).child(section_label("FOLDERS")));
+
+        // One row per folder the user has opened, indented by depth. The row a
+        // click lands on is a node of this very tree, so it always names a
+        // folder that exists — unlike a breadcrumb built from path text, which
+        // can point at the middle of a chain the scanner folded into one node.
+        let rows = self.nav_rows();
+        let total = rows.len();
+        for (index, row) in rows.into_iter().enumerate() {
+            let indent = 7.0 + row.depth as f32 * NAV_INDENT;
+            let key = cache_key(&row.node.path);
+            let is_focus = row.node.path.eq_ignore_ascii_case(&focus_path);
+            let target = row.node.path.clone();
+            let toggle = row.node.path.clone();
+            let name = if row.node.name.is_empty() {
+                row.node.path.clone()
+            } else {
+                row.node.name.clone()
+            };
             pane = pane.child(
                 div()
-                    .id(SharedString::from(format!("nav-crumb-{index}")))
+                    .id(SharedString::from(format!("nav-row-{key}")))
                     .flex()
                     .items_center()
-                    .gap(px(5.0))
-                    .pl(px(7.0 + index as f32 * 10.0))
+                    .h(px(NAV_ROW_H))
+                    .pl(px(indent))
                     .pr(px(6.0))
-                    .py(px(3.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .text_color(if current {
-                        theme::text()
+                    .rounded(px(4.0))
+                    .bg(if is_focus {
+                        theme::accent_soft()
                     } else {
-                        theme::text_dim()
+                        theme::surface()
                     })
-                    .font_weight(if current {
-                        FontWeight::MEDIUM
-                    } else {
-                        FontWeight::NORMAL
-                    })
-                    .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.jump_to(target.clone(), cx);
-                    }))
+                    .hover(|style| style.bg(theme::surface_alt()))
+                    .child(
+                        // The chevron opens and closes a folder without moving
+                        // the chart, so it is its own click target rather than
+                        // part of the row's.
+                        div()
+                            .id(SharedString::from(format!("nav-toggle-{key}")))
+                            .w(px(12.0))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(8.5))
+                            .opacity(if row.has_children { 0.75 } else { 0.0 })
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_nav(&toggle, cx);
+                            }))
+                            .child(if row.expanded { "▾" } else { "▸" }),
+                    )
                     .child(
                         div()
-                            .text_size(px(9.0))
-                            .opacity(0.6)
-                            .child(if current { "▸" } else { "·" }),
-                    )
-                    .child(div().flex_shrink_0().whitespace_nowrap().child(label)),
+                            .id(SharedString::from(format!("nav-open-{key}")))
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .cursor_pointer()
+                            .font_weight(if is_focus {
+                                FontWeight::MEDIUM
+                            } else {
+                                FontWeight::NORMAL
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.jump_to(target.clone(), cx);
+                            }))
+                            .child(div().flex_shrink_0().whitespace_nowrap().child(name))
+                            .child(
+                                div()
+                                    .text_size(px(9.0))
+                                    .text_color(theme::text_faint())
+                                    .whitespace_nowrap()
+                                    .child(theme::format_bytes(row.node.size)),
+                            ),
+                    ),
             );
+            if index + 1 == total && total >= MAX_NAV_ROWS {
+                pane = pane.child(
+                    div()
+                        .pl(px(19.0))
+                        .py(px(3.0))
+                        .text_size(px(9.0))
+                        .text_color(theme::text_faint())
+                        .child("Close a folder to see more"),
+                );
+            }
         }
 
         // The frame stays the width the layout reserves; only its contents move.
-        div()
+        let vertical = self.nav_bar(true);
+        let horizontal = self.nav_bar(false);
+        let mut frame = div()
             .w(px(NAV_W))
             .flex_shrink_0()
+            .relative()
             .flex()
             .flex_col()
             .rounded(px(10.0))
@@ -1206,6 +1448,15 @@ impl DiskApp {
             .border_color(theme::hairline())
             .text_size(px(11.5))
             .overflow_hidden()
+            // A drag that started on a thumb follows the pointer anywhere over
+            // the pane, so the move and release are handled by the frame.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_nav(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.end_nav_drag(cx)),
+            )
             .child(
                 // A row, with the content sized to what it needs rather than
                 // stretched: the scroll extent is measured from this child's
@@ -1217,9 +1468,73 @@ impl DiskApp {
                     .flex()
                     .flex_row()
                     .items_start()
+                    .track_scroll(&self.nav_scroll)
                     .overflow_scroll()
                     .child(pane.flex_shrink_0().min_w(px(NAV_W - 2.0))),
-            )
+            );
+
+        // The window backend paints no scrollbars of its own, so the pane draws
+        // its own from the handle's offset: both axes are usable without a
+        // trackpad or a Shift+wheel.
+        if let Some((thumb, track)) = vertical {
+            let top = (track - thumb) * self.nav_progress(true);
+            frame = frame.child(
+                div()
+                    .absolute()
+                    .top(px(NAV_BAR))
+                    .right(px(1.0))
+                    .h(px(track))
+                    .w(px(NAV_BAR))
+                    .rounded_full()
+                    .bg(theme::track())
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(top))
+                            .w_full()
+                            .h(px(thumb))
+                            .rounded_full()
+                            .bg(theme::text_faint())
+                            .hover(|style| style.bg(theme::text_dim()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_nav_drag(true, event, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+        if let Some((thumb, track)) = horizontal {
+            let left = (track - thumb) * self.nav_progress(false);
+            frame = frame.child(
+                div()
+                    .absolute()
+                    .left(px(NAV_BAR))
+                    .bottom(px(1.0))
+                    .w(px(track))
+                    .h(px(NAV_BAR))
+                    .rounded_full()
+                    .bg(theme::track())
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(left))
+                            .h_full()
+                            .w(px(thumb))
+                            .rounded_full()
+                            .bg(theme::text_faint())
+                            .hover(|style| style.bg(theme::text_dim()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_nav_drag(false, event, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+        frame
     }
 
     /// The table itself: the folder's own toolbar, the column header, the
@@ -3481,6 +3796,18 @@ fn usage_fraction(drive: &DriveInfo) -> f32 {
     used as f32 / drive.total as f32
 }
 
+/// A folder by absolute path.
+///
+/// `Node::find` also matches files, and a breadcrumb segment can name a path
+/// that exists both as a small file and as the head of a folder chain
+/// (`app.asar.unpacked` beside `app.asar.unpacked/dsh/node_modules`). Focusing
+/// the file would centre the chart on something with no children, so only
+/// folders come back from here.
+fn find_dir(tree: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
+    let found = Node::find(tree, path)?;
+    found.is_dir().then_some(found)
+}
+
 /// `to_dto` folds a chain of single-child folders into one node (`a/b/c`), so
 /// path arithmetic would land on a prefix that the tree happens to expose as
 /// some unrelated node (the file `app.asar.unpacked` next to the folded
@@ -3500,37 +3827,91 @@ fn parent_of(tree: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
     None
 }
 
-/// The deepest tree node that lives *below* `path`, used when a breadcrumb
-/// segment names the middle of a folded chain and no node carries that exact
-/// path.
-fn deepest_inside(node: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
-    let mut deepest: Option<Arc<Node>> = None;
-    for child in &node.children {
-        if is_inside(&child.path, path) {
-            // The segment is deeper than this child: keep walking down to it.
-            if let Some(found) = deepest_inside(child, path) {
-                keep_deeper(&mut deepest, found);
+/// The nearest folder that stands for `path`, used when a breadcrumb segment
+/// names the middle of a folder chain the scanner folded into one node.
+///
+/// The nearest one is the right answer: it is the chain itself, and opening it
+/// shows the chain's children. The deepest match would jump past the segment
+/// into some folder several levels further down, which is what a click on the
+/// segment used to do. Files are ignored even when one shares the segment's
+/// exact path — `app.asar.unpacked` exists both as a file and as the head of a
+/// chain.
+fn nearest_below(tree: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
+    let mut node = tree.clone();
+    loop {
+        let mut deeper: Option<Arc<Node>> = None;
+        let mut exact: Option<Arc<Node>> = None;
+        let mut below: Option<Arc<Node>> = None;
+        for child in node.children.iter().filter(|child| child.is_dir()) {
+            if is_inside(&child.path, path) {
+                // This folder contains the segment: keep walking to it.
+                deeper = Some(child.clone());
+                break;
             }
-        } else if is_inside(path, &child.path) {
-            // The child (or something under it) is the chain below the segment.
-            let found = deepest_inside(child, path).unwrap_or_else(|| child.clone());
-            keep_deeper(&mut deepest, found);
+            if exact.is_none() && child.path.eq_ignore_ascii_case(path) {
+                exact = Some(child.clone());
+            }
+            if below.is_none() && is_inside(path, &child.path) {
+                // The first folder that sits below the segment stands for it.
+                below = Some(child.clone());
+            }
+        }
+        match deeper {
+            Some(child) => node = child,
+            None => return exact.or(below),
         }
     }
-    deepest
 }
 
-fn keep_deeper(best: &mut Option<Arc<Node>>, candidate: Arc<Node>) {
-    if best
-        .as_ref()
-        .is_none_or(|current| candidate.path.len() > current.path.len())
-    {
-        *best = Some(candidate);
+/// Push `node` and, when it is open, its folders, in display order.
+fn push_nav_rows(
+    node: &Arc<Node>,
+    depth: usize,
+    expanded: &HashSet<String>,
+    rows: &mut Vec<NavRow>,
+) {
+    if rows.len() >= MAX_NAV_ROWS {
+        return;
+    }
+    let has_children = node.children.iter().any(|child| child.is_dir());
+    let open = has_children && expanded.contains(&cache_key(&node.path));
+    rows.push(NavRow {
+        node: node.clone(),
+        depth,
+        expanded: open,
+        has_children,
+    });
+    if !open {
+        return;
+    }
+    for child in node.children.iter().filter(|child| child.is_dir()) {
+        if rows.len() >= MAX_NAV_ROWS {
+            return;
+        }
+        push_nav_rows(child, depth + 1, expanded, rows);
     }
 }
 
-/// True when `child` sits somewhere below `parent` (`C:\` contains `C:\Users`).
-/// Whether `child` lives inside `parent`. The comparison is case-insensitive on
+/// Open the root and every folder above `path`.
+fn reveal_path(node: &Arc<Node>, path: &str, expanded: &mut HashSet<String>) {
+    let contains = is_inside(&node.path, path);
+    // The scanned root is always open: a tree that starts closed shows one row
+    // and looks the way the old breadcrumb did.
+    if (contains || path.eq_ignore_ascii_case(&node.path))
+        && node.children.iter().any(|child| child.is_dir())
+    {
+        expanded.insert(cache_key(&node.path));
+    }
+    if !contains {
+        return;
+    }
+    for child in node.children.iter().filter(|child| child.is_dir()) {
+        reveal_path(child, path, expanded);
+    }
+}
+
+/// Whether `child` lives inside `parent` (`C:\` contains `C:\Users`). The
+/// comparison is case-insensitive on
 /// Windows and case-sensitive elsewhere, and the separator has to follow the
 /// prefix so `/home/bob` is not mistaken for a child of `/home/bo`.
 fn is_inside(parent: &str, child: &str) -> bool {
@@ -3802,7 +4183,7 @@ impl Render for DiskApp {
                 // Same pane in every view: the volumes, then the open folder's
                 // chain. It disappears only before the first tree exists.
                 if let Some(focus) = &focus {
-                    row = row.child(self.detail_nav(focus, cx));
+                    row = row.child(self.detail_nav(focus, window, cx));
                 }
                 row = row.child(self.chart_area(viewport_w, viewport_h, nav_w, window, cx));
                 // The details table already lists the children with their
@@ -4035,15 +4416,123 @@ mod tests {
         );
         assert!(parent_of(&root, &root.path).is_none());
 
-        // A breadcrumb segment pointing at the middle of the chain still lands
-        // on the deepest node that lives under it.
+        // A segment pointing at the middle of the chain resolves to the chain
+        // itself, not to a folder several levels below it: opening the chain is
+        // what the segment names.
+        let nested = folder(
+            &format!("node_modules{sep}pkg"),
+            &format!("{chain_path}{sep}pkg"),
+            200,
+            Vec::new(),
+        );
+        let chain = folder(
+            &format!("app.asar.unpacked{sep}dsh{sep}node_modules"),
+            &chain_path,
+            300,
+            vec![nested.clone()],
+        );
+        let loose_file = Arc::new(Node {
+            name: "app.asar.unpacked".to_string(),
+            path: loose_path.clone(),
+            size: 1,
+            files: 1,
+            dirs: 0,
+            kind: Kind::File,
+            children: Vec::new(),
+        });
+        let resources = folder(
+            "resources",
+            &resources_path,
+            400,
+            vec![chain.clone(), loose_file],
+        );
+        let app = folder("App", &app_path, 500, vec![resources.clone()]);
+        let root = folder("root", &root_path, 500, vec![app.clone()]);
+
         assert_eq!(
-            deepest_inside(&root, &loose_path)
+            nearest_below(&root, &loose_path)
                 .expect("the chain below the segment")
                 .path,
+            chain.path,
+            "the chain stands for the segment, not the file of the same name"
+        );
+        assert_eq!(
+            nearest_below(&root, &chain_path).expect("the chain matches itself").path,
             chain.path
         );
-        assert!(deepest_inside(&root, &chain.path).is_none());
+        assert!(
+            nearest_below(&root, &format!("{chain_path}{sep}pkg{sep}gone")).is_none(),
+            "a path nothing represents resolves to nothing"
+        );
+        // A file must never become the focus, however exactly it matches.
+        assert!(find_dir(&root, &loose_path).is_none());
+        assert_eq!(
+            find_dir(&root, &chain_path).expect("a folder by its own path").path,
+            chain.path
+        );
+    }
+
+    #[test]
+    fn the_navigation_tree_shows_only_open_folders() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let root_path = if cfg!(windows) { "C:\\" } else { "/" };
+        let users_path = format!("{root_path}Users");
+        let bob_path = format!("{users_path}{sep}bob");
+        let deep_path = format!("{bob_path}{sep}pictures");
+
+        let deep = folder("pictures", &deep_path, 10, Vec::new());
+        let bob = folder("bob", &bob_path, 10, vec![deep]);
+        let users = folder("Users", &users_path, 10, vec![bob]);
+        let file = Arc::new(Node {
+            name: "readme.txt".to_string(),
+            path: format!("{root_path}readme.txt"),
+            size: 1,
+            files: 1,
+            dirs: 0,
+            kind: Kind::File,
+            children: Vec::new(),
+        });
+        let root = folder("root", root_path, 21, vec![users, file]);
+
+        let mut expanded = HashSet::new();
+        // Nothing open but the root: only the root's folders are listed.
+        reveal_path(&root, &deep_path, &mut expanded);
+        let mut rows = Vec::new();
+        push_nav_rows(&root, 0, &expanded, &mut rows);
+        let names: Vec<&str> = rows.iter().map(|row| row.node.name.as_str()).collect();
+        assert_eq!(names, vec!["root", "Users", "bob", "pictures"], "files stay out of the tree");
+        assert_eq!(rows[3].depth, 3, "each level indents once");
+        assert!(!rows[3].expanded, "the focused folder itself is closed");
+
+        // Closing `bob` hides everything below it.
+        expanded.remove(&cache_key(&bob_path));
+        let mut rows = Vec::new();
+        push_nav_rows(&root, 0, &expanded, &mut rows);
+        let names: Vec<&str> = rows.iter().map(|row| row.node.name.as_str()).collect();
+        assert_eq!(names, vec!["root", "Users", "bob"]);
+        assert!(!rows[2].expanded);
+        assert!(rows[2].has_children, "bob still offers its chevron");
+    }
+
+    #[test]
+    fn revealing_a_folder_opens_its_ancestors_only() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let root_path = if cfg!(windows) { "C:\\" } else { "/" };
+        let a_path = format!("{root_path}a");
+        let b_path = format!("{a_path}{sep}b");
+        let other_path = format!("{root_path}other");
+        let leaf = folder("b", &b_path, 1, Vec::new());
+        let a = folder("a", &a_path, 1, vec![leaf]);
+        let other = folder("other", &other_path, 1, Vec::new());
+        let root = folder("root", root_path, 2, vec![a, other]);
+
+        let mut expanded = HashSet::new();
+        reveal_path(&root, &b_path, &mut expanded);
+
+        assert!(expanded.contains(&cache_key(root_path)), "the root opens");
+        assert!(expanded.contains(&cache_key(&a_path)), "the folder above opens");
+        assert!(!expanded.contains(&cache_key(&b_path)), "the folder itself stays closed");
+        assert!(!expanded.contains(&cache_key(&other_path)), "a sibling stays closed");
     }
 
     #[test]
