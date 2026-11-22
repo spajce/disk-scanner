@@ -212,6 +212,18 @@ struct Cached {
     at: SystemTime,
 }
 
+/// One row of the navigation tree: a volume, or a folder below one.
+enum NavEntry {
+    Drive {
+        drive: DriveInfo,
+        expanded: bool,
+        has_children: bool,
+        /// The volume the chart is currently showing.
+        active: bool,
+    },
+    Folder(NavRow),
+}
+
 /// One row of the navigation tree: a folder, how deep it sits, and whether its
 /// children are showing.
 struct NavRow {
@@ -459,16 +471,25 @@ impl DiskApp {
         }
     }
 
-    /// Open every folder above `path`, plus the root, so the tree shows where
-    /// the chart currently is. Called every frame, so a scan, a chart click or a
-    /// shortcut all keep the tree in step without any bookkeeping at the call
-    /// sites.
+    /// Open every folder above `path`, plus the volume it lives on, so the tree
+    /// shows where the chart currently is. Called only when the focus changes,
+    /// so a folder the user closed stays closed.
     fn reveal_in_nav(&mut self, path: &str) {
         let Some(tree) = self.tree.clone() else { return };
+        if let Some(drive) = self
+            .drives
+            .iter()
+            .find(|drive| {
+                drive.root.eq_ignore_ascii_case(path) || is_inside(&drive.root, path)
+            })
+        {
+            self.nav_expanded.insert(cache_key(&drive.root));
+        }
         reveal_path(&tree, path, &mut self.nav_expanded);
     }
 
-    /// Open or close one folder's children in the navigation tree.
+    /// Open or close one folder's children in the navigation tree. The same
+    /// switch opens and closes a volume.
     fn toggle_nav(&mut self, path: &str, cx: &mut Context<Self>) {
         let key = cache_key(path);
         if !self.nav_expanded.remove(&key) {
@@ -477,15 +498,55 @@ impl DiskApp {
         cx.notify();
     }
 
-    /// The visible rows of the navigation tree: the root, then the children of
-    /// every folder that is open.
-    fn nav_rows(&self) -> Vec<NavRow> {
-        let Some(tree) = self.tree.as_ref() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        push_nav_rows(tree, 0, &self.nav_expanded, &mut rows);
-        rows
+    /// The rows of the navigation tree: every volume, and the folders below the
+    /// ones that are open.
+    fn nav_entries(&self) -> Vec<NavEntry> {
+        let active_root = self.active_drive().map(|drive| drive.root.clone());
+        let mut entries = Vec::new();
+        for drive in &self.drives {
+            if entries.len() >= MAX_NAV_ROWS {
+                break;
+            }
+            let active = active_root
+                .as_deref()
+                .is_some_and(|root| root.eq_ignore_ascii_case(&drive.root));
+            let tree = self.tree_for(&drive.root);
+            let expanded = self.nav_expanded.contains(&cache_key(&drive.root));
+
+            let has_children = tree.as_ref().is_some_and(|node| {
+                if node.path.eq_ignore_ascii_case(&drive.root) {
+                    node.children.iter().any(|child| child.is_dir())
+                } else {
+                    // The scan was of a folder inside this volume, and that
+                    // folder is the one row the tree knows about.
+                    true
+                }
+            });
+            entries.push(NavEntry::Drive {
+                drive: drive.clone(),
+                expanded: expanded && has_children,
+                has_children,
+                active,
+            });
+            let mut rows = Vec::new();
+            push_drive_rows(&drive.root, tree.as_ref(), &self.nav_expanded, &mut rows);
+            entries.extend(rows.into_iter().map(NavEntry::Folder));
+        }
+        entries
+    }
+
+    /// The tree this volume can draw: the scan in memory, or the one for the
+    /// chart on screen when it was a folder inside this volume.
+    fn tree_for(&self, root: &str) -> Option<Arc<Node>> {
+        if let Some(cached) = self.cache.get(&cache_key(root)) {
+            return Some(cached.tree.clone());
+        }
+        self.tree
+            .as_ref()
+            .filter(|tree| {
+                tree.path.eq_ignore_ascii_case(root) || is_inside(root, &tree.path)
+            })
+            .cloned()
     }
 
     /// Thumb length and track length for one scrollbar, or `None` when that
@@ -1267,160 +1328,205 @@ impl DiskApp {
             .p(px(8.0))
             .child(section_label("THIS PC"));
 
-        let active_root = self.active_drive().map(|drive| drive.root.clone());
-        for drive in &self.drives {
-            let active = active_root
-                .as_deref()
-                .is_some_and(|root| root.eq_ignore_ascii_case(&drive.root));
-            let fraction = usage_fraction(drive);
-            let root = drive.root.clone();
-            let title = drive_title(drive);
-            let usage = format!(
-                "{} free of {}",
-                theme::format_bytes(drive.free),
-                theme::format_bytes(drive.total)
-            );
-            pane = pane.child(
-                div()
-                    .id(SharedString::from(format!("nav-{root}")))
-                    .flex()
-                    .flex_col()
-                    .gap(px(3.0))
-                    .px(px(7.0))
-                    .py(px(5.0))
-                    .rounded(px(7.0))
-                    .cursor_pointer()
-                    .bg(if active {
-                        theme::accent_soft()
-                    } else {
-                        theme::surface()
-                    })
-                    .hover(|style| style.bg(theme::surface_alt()))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.last_root.eq_ignore_ascii_case(&root) {
-                            this.switch_to(root.clone(), cx);
-                        }
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(div().text_size(px(11.0)).child("💾"))
-                            .child(div().flex_shrink_0().whitespace_nowrap().child(title)),
-                    )
-                    .child(
-                        div()
-                            .h(px(3.0))
-                            .w_full()
-                            .rounded_full()
-                            .bg(theme::track())
-                            .child(
-                                div()
-                                    .h_full()
-                                    .rounded_full()
-                                    .bg(if fraction > 0.9 {
-                                        theme::danger()
-                                    } else {
-                                        theme::accent()
-                                    })
-                                    // A fraction of the row rather than a fixed
-                                    // width, so the bar stays honest when a
-                                    // long name has widened the pane.
-                                    .w(relative(fraction)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(9.5))
-                            .text_color(theme::text_faint())
-                            .whitespace_nowrap()
-                            .child(usage),
-                    ),
-            );
-        }
-
-        pane = pane.child(div().mt(px(8.0)).child(section_label("FOLDERS")));
-
-        // One row per folder the user has opened, indented by depth. The row a
-        // click lands on is a node of this very tree, so it always names a
+        // Volumes are the top level of the tree, and their folders hang off
+        // them: one list instead of a drive picker above a folder list. The row
+        // a click lands on is a node of this very tree, so it always names a
         // folder that exists — unlike a breadcrumb built from path text, which
         // can point at the middle of a chain the scanner folded into one node.
-        let rows = self.nav_rows();
-        let total = rows.len();
-        for (index, row) in rows.into_iter().enumerate() {
-            let indent = 7.0 + row.depth as f32 * NAV_INDENT;
-            let key = cache_key(&row.node.path);
-            let is_focus = row.node.path.eq_ignore_ascii_case(&focus_path);
-            let target = row.node.path.clone();
-            let toggle = row.node.path.clone();
-            let name = if row.node.name.is_empty() {
-                row.node.path.clone()
-            } else {
-                row.node.name.clone()
-            };
-            pane = pane.child(
-                div()
-                    .id(SharedString::from(format!("nav-row-{key}")))
-                    .flex()
-                    .items_center()
-                    .h(px(NAV_ROW_H))
-                    .pl(px(indent))
-                    .pr(px(6.0))
-                    .rounded(px(4.0))
-                    .bg(if is_focus {
-                        theme::accent_soft()
-                    } else {
-                        theme::surface()
-                    })
-                    .hover(|style| style.bg(theme::surface_alt()))
-                    .child(
-                        // The chevron opens and closes a folder without moving
-                        // the chart, so it is its own click target rather than
-                        // part of the row's.
+        let entries = self.nav_entries();
+        let total = entries.len();
+        for (index, entry) in entries.into_iter().enumerate() {
+            match entry {
+                NavEntry::Drive {
+                    drive,
+                    expanded,
+                    has_children,
+                    active,
+                } => {
+                    let fraction = usage_fraction(&drive);
+                    let root = drive.root.clone();
+                    let toggle = drive.root.clone();
+                    let title = drive_title(&drive);
+                    let usage = format!(
+                        "{} free of {}",
+                        theme::format_bytes(drive.free),
+                        theme::format_bytes(drive.total)
+                    );
+                    let key = cache_key(&root);
+                    pane = pane.child(
                         div()
-                            .id(SharedString::from(format!("nav-toggle-{key}")))
-                            .w(px(12.0))
-                            .flex_shrink_0()
+                            .id(SharedString::from(format!("nav-drive-{key}")))
                             .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_size(px(8.5))
-                            .opacity(if row.has_children { 0.75 } else { 0.0 })
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_nav(&toggle, cx);
-                            }))
-                            .child(if row.expanded { "▾" } else { "▸" }),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("nav-open-{key}")))
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .gap(px(4.0))
-                            .cursor_pointer()
-                            .font_weight(if is_focus {
-                                FontWeight::MEDIUM
+                            .flex_col()
+                            .gap(px(3.0))
+                            .px(px(4.0))
+                            .py(px(5.0))
+                            .rounded(px(7.0))
+                            .bg(if active {
+                                theme::accent_soft()
                             } else {
-                                FontWeight::NORMAL
+                                theme::surface()
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.jump_to(target.clone(), cx);
-                            }))
-                            .child(div().flex_shrink_0().whitespace_nowrap().child(name))
+                            .hover(|style| style.bg(theme::surface_alt()))
+                            // The header switches to the volume; the chevron
+                            // only opens it, so both are separate targets.
                             .child(
                                 div()
-                                    .text_size(px(9.0))
-                                    .text_color(theme::text_faint())
-                                    .whitespace_nowrap()
-                                    .child(theme::format_bytes(row.node.size)),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(3.0))
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("nav-drive-toggle-{key}")))
+                                            .w(px(12.0))
+                                            .flex_shrink_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .text_size(px(8.5))
+                                            .opacity(if has_children { 0.75 } else { 0.0 })
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.toggle_nav(&toggle, cx);
+                                            }))
+                                            .child(if expanded { "▾" } else { "▸" }),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!("nav-drive-open-{key}")))
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(5.0))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                if !this.last_root.eq_ignore_ascii_case(&root) {
+                                                    this.switch_to(root.clone(), cx);
+                                                }
+                                            }))
+                                            .child(div().text_size(px(11.0)).child("💾"))
+                                            .child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .whitespace_nowrap()
+                                                    .child(title),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(3.0))
+                                    .pl(px(12.0))
+                                    .child(
+                                        div()
+                                            .h(px(3.0))
+                                            .w_full()
+                                            .rounded_full()
+                                            .bg(theme::track())
+                                            .child(
+                                                div()
+                                                    .h_full()
+                                                    .rounded_full()
+                                                    .bg(if fraction > 0.9 {
+                                                        theme::danger()
+                                                    } else {
+                                                        theme::accent()
+                                                    })
+                                                    // A fraction of the row rather
+                                                    // than a fixed width, so the bar
+                                                    // stays honest when a long name
+                                                    // has widened the pane.
+                                                    .w(relative(fraction)),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(9.5))
+                                            .text_color(theme::text_faint())
+                                            .whitespace_nowrap()
+                                            .child(usage),
+                                    ),
                             ),
-                    ),
-            );
+                    );
+                }
+                NavEntry::Folder(row) => {
+                    let indent = 7.0 + row.depth as f32 * NAV_INDENT;
+                    let key = cache_key(&row.node.path);
+                    let is_focus = row.node.path.eq_ignore_ascii_case(&focus_path);
+                    let target = row.node.path.clone();
+                    let toggle = row.node.path.clone();
+                    let name = if row.node.name.is_empty() {
+                        row.node.path.clone()
+                    } else {
+                        row.node.name.clone()
+                    };
+                    pane = pane.child(
+                        div()
+                            .id(SharedString::from(format!("nav-row-{key}")))
+                            .flex()
+                            .items_center()
+                            .h(px(NAV_ROW_H))
+                            .pl(px(indent))
+                            .pr(px(6.0))
+                            .rounded(px(4.0))
+                            .bg(if is_focus {
+                                theme::accent_soft()
+                            } else {
+                                theme::surface()
+                            })
+                            .hover(|style| style.bg(theme::surface_alt()))
+                            .child(
+                                // The chevron opens and closes a folder without
+                                // moving the chart, so it is its own click target
+                                // rather than part of the row's.
+                                div()
+                                    .id(SharedString::from(format!("nav-toggle-{key}")))
+                                    .w(px(12.0))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(8.5))
+                                    .opacity(if row.has_children { 0.75 } else { 0.0 })
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.toggle_nav(&toggle, cx);
+                                    }))
+                                    .child(if row.expanded { "▾" } else { "▸" }),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("nav-open-{key}")))
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
+                                    .cursor_pointer()
+                                    .font_weight(if is_focus {
+                                        FontWeight::MEDIUM
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.jump_to(target.clone(), cx);
+                                    }))
+                                    .child(div().flex_shrink_0().whitespace_nowrap().child(name))
+                                    .child(
+                                        div()
+                                            .text_size(px(9.0))
+                                            .text_color(theme::text_faint())
+                                            .whitespace_nowrap()
+                                            .child(theme::format_bytes(row.node.size)),
+                                    ),
+                            ),
+                    );
+                }
+            }
             if index + 1 == total && total >= MAX_NAV_ROWS {
                 pane = pane.child(
                     div()
@@ -3863,6 +3969,33 @@ fn nearest_below(tree: &Arc<Node>, path: &str) -> Option<Arc<Node>> {
     }
 }
 
+/// Push the folders that belong under a volume, or nothing when it is closed.
+///
+/// The scan in memory normally starts at the volume root, so its children are
+/// the top level of the tree. When the user scanned one folder instead, that
+/// folder is the only row the tree can honestly show beneath the volume.
+fn push_drive_rows(
+    root: &str,
+    tree: Option<&Arc<Node>>,
+    expanded: &HashSet<String>,
+    rows: &mut Vec<NavRow>,
+) {
+    if !expanded.contains(&cache_key(root)) {
+        return;
+    }
+    let Some(tree) = tree else { return };
+    if tree.path.eq_ignore_ascii_case(root) {
+        for child in tree.children.iter().filter(|child| child.is_dir()) {
+            if rows.len() >= MAX_NAV_ROWS {
+                return;
+            }
+            push_nav_rows(child, 1, expanded, rows);
+        }
+    } else if is_inside(root, &tree.path) {
+        push_nav_rows(tree, 1, expanded, rows);
+    }
+}
+
 /// Push `node` and, when it is open, its folders, in display order.
 fn push_nav_rows(
     node: &Arc<Node>,
@@ -4512,6 +4645,52 @@ mod tests {
         assert_eq!(names, vec!["root", "Users", "bob"]);
         assert!(!rows[2].expanded);
         assert!(rows[2].has_children, "bob still offers its chevron");
+    }
+
+    #[test]
+    fn a_volume_lists_its_folders_one_level_down() {
+        let sep = std::path::MAIN_SEPARATOR;
+        let root_path = if cfg!(windows) { "C:\\" } else { "/" };
+        let users_path = format!("{root_path}Users");
+        let bob_path = format!("{users_path}{sep}bob");
+
+        let bob = folder("bob", &bob_path, 5, Vec::new());
+        let users = folder("Users", &users_path, 5, vec![bob]);
+        let file = Arc::new(Node {
+            name: "readme.txt".to_string(),
+            path: format!("{root_path}readme.txt"),
+            size: 1,
+            files: 1,
+            dirs: 0,
+            kind: Kind::File,
+            children: Vec::new(),
+        });
+        let root = folder("C:\\", root_path, 11, vec![users, file]);
+
+        // Closed volume: nothing below it.
+        let mut expanded = HashSet::new();
+        let mut rows = Vec::new();
+        push_drive_rows(root_path, Some(&root), &expanded, &mut rows);
+        assert!(rows.is_empty(), "a closed volume shows no folders");
+
+        // Open volume: its folders sit one level in from the volume row, and
+        // files stay out.
+        expanded.insert(cache_key(root_path));
+        let mut rows = Vec::new();
+        push_drive_rows(root_path, Some(&root), &expanded, &mut rows);
+        let names: Vec<&str> = rows.iter().map(|row| row.node.name.as_str()).collect();
+        assert_eq!(names, vec!["Users"], "the volume row is drawn by the caller");
+        assert_eq!(rows[0].depth, 1, "folders indent once under the volume");
+        assert!(!rows[0].expanded, "an open volume does not open its folders");
+
+        // A scan of a folder inside the volume is the only row it can show.
+        let inside = format!("{root_path}Users");
+        let sub = folder("Users", &inside, 5, Vec::new());
+        let mut rows = Vec::new();
+        push_drive_rows(root_path, Some(&sub), &expanded, &mut rows);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node.path, inside);
+        assert_eq!(rows[0].depth, 1);
     }
 
     #[test]
