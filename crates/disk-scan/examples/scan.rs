@@ -2,21 +2,52 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use disk_scan::{scan, to_dto, ScanCounters};
+use disk_scan::{scan, to_dto, walk_threads, ScanCounters};
 
 
 fn count(node: &disk_scan::NodeDto) -> usize {
     1 + node.children.iter().map(count).sum::<usize>()
 }
 
+/// Reports the walk's own counters every couple of seconds.
+///
+/// A cold walk of a spinning disk runs for minutes with no output, which reads
+/// as a hang; the counters say it is alive and what it is reading. Silent for
+/// the first few seconds, so a fast scan prints nothing extra.
+fn follow(counters: Arc<ScanCounters>, done: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        while !done.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(3));
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+            let (files, dirs, bytes, errors, path) = counters.snapshot();
+            eprintln!("  {files} files · {dirs} dirs · {bytes} bytes · {errors} errors · {path}");
+        }
+    });
+}
+
 fn main() {
     let target = std::env::args().nth(1).unwrap_or_else(|| String::from("C:\\"));
     let cancel = AtomicBool::new(false);
-    let counters = ScanCounters::new();
+    let counters = Arc::new(ScanCounters::new());
+    let done = Arc::new(AtomicBool::new(false));
+    follow(Arc::clone(&counters), Arc::clone(&done));
 
     let started = Instant::now();
+    let forced = std::env::var("DISK_SCAN_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let policy = match (walk_threads(Path::new(&target)), forced) {
+        (Some(count), Some(_)) => format!("{count} threads (DISK_SCAN_THREADS)"),
+        (Some(count), None) => format!("{count} threads (seek-penalty volume)"),
+        (None, Some(_)) => String::from("the global pool (DISK_SCAN_THREADS=0)"),
+        (None, None) => String::from("the global pool"),
+    };
+    eprintln!("walking {target} on {policy}");
     let root = match scan(Path::new(&target), &cancel, &counters) {
         Ok(root) => root,
         Err(error) => {
@@ -25,6 +56,7 @@ fn main() {
         }
     };
     let elapsed = started.elapsed();
+    done.store(true, Ordering::Relaxed);
 
     let compacted = Instant::now();
     let dto = to_dto(&root, root.size);

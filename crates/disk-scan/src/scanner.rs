@@ -165,7 +165,144 @@ fn scan_with(
     if !meta.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
-    Ok(walk(root, cancel, pause, counters, 0))
+    // The pool is chosen per scan: a spinning disk and an SSD want opposite
+    // amounts of concurrency, and the root is what decides which one this is.
+    match walk_pool(root) {
+        Some(pool) => Ok(pool.install(|| walk(root, cancel, pause, counters, 0))),
+        None => Ok(walk(root, cancel, pause, counters, 0)),
+    }
+}
+
+/// A private pool for the walk, or `None` to use rayon's global one.
+///
+/// On a spinning disk the directories are scattered across the platter, so a
+/// full core count of threads turns every listing into a seek and the walk
+/// spends its time thrashing rather than reading. There the walk runs on a
+/// small pool of its own. Anything else — SSD, NVMe, a network share — keeps
+/// the global pool, where more threads really do mean more throughput.
+///
+/// `DISK_SCAN_THREADS` overrides the choice: a count pins it, `0` forces the
+/// global pool. That is how the two policies are compared on a cold cache.
+fn walk_pool(root: &Path) -> Option<rayon::ThreadPool> {
+    let threads = walk_threads(root)?;
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|index| format!("disk-scan-{index}"))
+        .build()
+        .ok()
+}
+
+/// Threads for a walk on this volume, or `None` for the global pool.
+fn default_threads(root: &Path) -> Option<usize> {
+    #[cfg(windows)]
+    {
+        if incurs_seek_penalty(root) == Some(true) {
+            return Some(rotation_threads());
+        }
+    }
+    let _ = root;
+    None
+}
+
+/// How many threads a walk of `root` will use, or `None` when it runs on the
+/// global pool.
+///
+/// Exposed so a caller can say which policy a volume got: a spinning disk and
+/// an SSD take opposite settings, and a scan that feels slow is usually one
+/// that landed on the wrong side of that choice.
+pub fn walk_threads(root: &Path) -> Option<usize> {
+    match std::env::var("DISK_SCAN_THREADS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        Some(0) => None,
+        Some(count) => Some(count),
+        None => default_threads(root),
+    }
+}
+
+/// Threads for a volume that has to seek between directories. Few enough that
+/// the requests the disk does receive are close together.
+fn rotation_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+        .min(4)
+}
+
+/// Whether this volume pays a seek penalty, as reported by the storage stack.
+///
+/// `None` when the question does not apply or cannot be answered: a UNC root,
+/// a volume handle that cannot be opened, or a driver that does not implement
+/// the query.
+#[cfg(windows)]
+fn incurs_seek_penalty(root: &Path) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR,
+        IOCTL_STORAGE_QUERY_PROPERTY, STORAGE_PROPERTY_QUERY,
+    };
+
+    let volume = volume_path(root)?;
+    let wide: Vec<u16> = volume.encode_utf16().chain(std::iter::once(0)).collect();
+    // No access rights: the device answers a property query from the handle
+    // alone, so this works without elevation.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+
+    let query = STORAGE_PROPERTY_QUERY {
+        PropertyId: StorageDeviceSeekPenaltyProperty,
+        QueryType: PropertyStandardQuery,
+        AdditionalParameters: [0],
+    };
+    let mut descriptor: DEVICE_SEEK_PENALTY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            std::ptr::addr_of!(query).cast(),
+            std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            std::ptr::addr_of_mut!(descriptor).cast(),
+            std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some(descriptor.IncursSeekPenalty != 0)
+}
+
+/// `C:\Users` -> `\\?\C:`. A volume is the unit the storage stack describes,
+/// and a UNC path has no single volume behind it.
+#[cfg(windows)]
+fn volume_path(root: &Path) -> Option<String> {
+    let text = root.to_string_lossy();
+    let mut units = text.chars();
+    let drive = units.next()?;
+    if units.next() != Some(':') || !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    Some(format!(r"\\?\{}:", drive.to_ascii_uppercase()))
 }
 
 /// What one directory listing turned up, without touching the filesystem again.
@@ -824,7 +961,7 @@ fn write_display_path(path: &Path, out: &mut String) {
 
 /// One path level down, using the platform's separator. A root such as `C:\`
 /// already ends in one, so it must not be doubled.
-fn child_path(parent: &str, name: &str) -> String {
+pub(crate) fn child_path(parent: &str, name: &str) -> String {
     if parent.is_empty() {
         return name.to_string();
     }
