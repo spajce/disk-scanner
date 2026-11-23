@@ -102,6 +102,12 @@ const DETAIL_HEADER_H: f32 = 26.0;
 const NAV_W: f32 = 226.0;
 /// One folder per row in the navigation tree.
 const NAV_ROW_H: f32 = 18.0;
+/// Padding between the navigation pane's frame and its rows.
+const NAV_PAD: f32 = 8.0;
+/// Width of a row when the tree is not scrolled sideways: the pane's frame,
+/// minus its border and padding. Volume rows are pinned to it so their usage
+/// bar keeps one length however wide a deep folder makes the tree.
+const NAV_INNER_W: f32 = NAV_W - 2.0 - NAV_PAD * 2.0;
 /// Indentation added per level of the navigation tree.
 const NAV_INDENT: f32 = 11.0;
 /// Rows the navigation tree will lay out. Expanding a few 500-entry folders
@@ -1325,7 +1331,7 @@ impl DiskApp {
             .flex()
             .flex_col()
             .gap(px(2.0))
-            .p(px(8.0))
+            .p(px(NAV_PAD))
             .child(section_label("THIS PC"));
 
         // Volumes are the top level of the tree, and their folders hang off
@@ -1359,6 +1365,7 @@ impl DiskApp {
                             .flex()
                             .flex_col()
                             .gap(px(3.0))
+                            .w(px(NAV_INNER_W))
                             .px(px(4.0))
                             .py(px(5.0))
                             .rounded(px(7.0))
@@ -1408,8 +1415,8 @@ impl DiskApp {
                                             .child(div().text_size(px(11.0)).child("💾"))
                                             .child(
                                                 div()
-                                                    .flex_shrink_0()
-                                                    .whitespace_nowrap()
+                                                    .min_w_0()
+                                                    .truncate()
                                                     .child(title),
                                             ),
                                     ),
@@ -1436,9 +1443,11 @@ impl DiskApp {
                                                         theme::accent()
                                                     })
                                                     // A fraction of the row rather
-                                                    // than a fixed width, so the bar
-                                                    // stays honest when a long name
-                                                    // has widened the pane.
+                                                    // than a fixed width. The row
+                                                    // itself is pinned to the
+                                                    // viewport, so the bar keeps
+                                                    // one length while folders
+                                                    // open and close.
                                                     .w(relative(fraction)),
                                             ),
                                     )
