@@ -410,6 +410,11 @@ mod tests {
                 "name": "disk-scanner-v0.1.5-linux-x64.tar.gz",
                 "browser_download_url": "https://example.invalid/linux.tar.gz",
                 "size": 6208375
+            },
+            {
+                "name": "disk-scanner-v0.1.5-macos-arm64.tar.gz",
+                "browser_download_url": "https://example.invalid/macos.tar.gz",
+                "size": 2040321
             }
         ]
     }"#;
@@ -435,7 +440,16 @@ mod tests {
             Some(suffix) => {
                 let asset = release.asset.expect("this platform's asset");
                 assert!(asset.name.ends_with(suffix), "{} vs {suffix}", asset.name);
-                assert_eq!(asset.size, 3_059_936);
+                // The name has to pick the platform's own archive, and its size
+                // has to come from that entry, not from whichever one is first.
+                let expected = if suffix.starts_with("windows") {
+                    3_059_936
+                } else if suffix.starts_with("macos") {
+                    2_040_321
+                } else {
+                    6_208_375
+                };
+                assert_eq!(asset.size, expected);
             }
             // A platform without a published build still reads the release.
             None => assert!(release.asset.is_none()),
