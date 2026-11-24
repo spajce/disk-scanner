@@ -22,6 +22,8 @@ use std::os::windows::ffi::OsStringExt;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::index::{Buckets, Category, FileIndex, ScanIndex};
+
 /// `FILE_ATTRIBUTE_REPARSE_POINT` — junctions, mount points and friends.
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
@@ -137,6 +139,15 @@ pub struct NodeDto {
 
 /// Walk `root` and return the raw tree.
 pub fn scan(root: &Path, cancel: &AtomicBool, counters: &ScanCounters) -> Result<RawNode, String> {
+    scan_indexed(root, cancel, counters).map(|(raw, _)| raw)
+}
+
+/// [`scan`] plus the whole-scan file index behind the file and type views.
+pub fn scan_indexed(
+    root: &Path,
+    cancel: &AtomicBool,
+    counters: &ScanCounters,
+) -> Result<(RawNode, ScanIndex), String> {
     scan_with(root, cancel, None, counters)
 }
 
@@ -151,6 +162,16 @@ pub fn scan_pausable(
     pause: &AtomicBool,
     counters: &ScanCounters,
 ) -> Result<RawNode, String> {
+    scan_pausable_indexed(root, cancel, pause, counters).map(|(raw, _)| raw)
+}
+
+/// [`scan_pausable`] with the file index.
+pub fn scan_pausable_indexed(
+    root: &Path,
+    cancel: &AtomicBool,
+    pause: &AtomicBool,
+    counters: &ScanCounters,
+) -> Result<(RawNode, ScanIndex), String> {
     scan_with(root, cancel, Some(pause), counters)
 }
 
@@ -159,18 +180,23 @@ fn scan_with(
     cancel: &AtomicBool,
     pause: Option<&AtomicBool>,
     counters: &ScanCounters,
-) -> Result<RawNode, String> {
+) -> Result<(RawNode, ScanIndex), String> {
     let meta = std::fs::metadata(root)
         .map_err(|err| format!("Cannot open {}: {}", root.display(), err))?;
     if !meta.is_dir() {
         return Err(format!("{} is not a folder", root.display()));
     }
+    // The index is fed by every worker, so it is created before the pool and
+    // read after the walk unwinds.
+    let index = FileIndex::new();
+    let walk_root = || walk(root, cancel, pause, counters, &index, 0);
     // The pool is chosen per scan: a spinning disk and an SSD want opposite
     // amounts of concurrency, and the root is what decides which one this is.
-    match walk_pool(root) {
-        Some(pool) => Ok(pool.install(|| walk(root, cancel, pause, counters, 0))),
-        None => Ok(walk(root, cancel, pause, counters, 0)),
-    }
+    let raw = match walk_pool(root) {
+        Some(pool) => pool.install(walk_root),
+        None => walk_root(),
+    };
+    Ok((raw, index.finish()))
 }
 
 /// A private pool for the walk, or `None` to use rayon's global one.
@@ -311,6 +337,8 @@ struct Listing {
     /// Only files at or above [`FILE_FLOOR`], so the caller never allocates for
     /// entries that can never become an arc.
     files: Vec<(u64, PathBuf)>,
+    /// Per-category totals for every file in this directory.
+    buckets: Buckets,
     files_seen: u64,
     bytes: u64,
     errors: u64,
@@ -322,6 +350,7 @@ impl Listing {
         Listing {
             subdirs: Vec::new(),
             files: Vec::new(),
+            buckets: Buckets::default(),
             files_seen: 0,
             bytes: 0,
             errors: 0,
@@ -447,6 +476,19 @@ fn allocated_size(path: &Path, logical: u64, wide: &mut Vec<u16>) -> u64 {
     ((high as u64) << 32) | low as u64
 }
 
+/// A listed file's last-write time as seconds since the Unix epoch, or -1 when
+/// the volume did not report one. `WIN32_FIND_DATAW` hands out the raw FILETIME
+/// the listing already carried, so the index dates cost no extra syscall.
+#[cfg(windows)]
+fn file_time_seconds(stamp: windows_sys::Win32::Foundation::FILETIME) -> i64 {
+    let ticks = ((stamp.dwHighDateTime as u64) << 32) | stamp.dwLowDateTime as u64;
+    if ticks == 0 {
+        return -1;
+    }
+    // 100 ns ticks from 1601-01-01 to 1970-01-01.
+    (ticks / 10_000_000) as i64 - 11_644_473_600
+}
+
 /// Read a directory through `FindFirstFileExW`.
 ///
 /// `FindExInfoBasic` skips the 8.3 short name, which NTFS would otherwise have
@@ -455,9 +497,13 @@ fn allocated_size(path: &Path, logical: u64, wide: &mut Vec<u16>) -> u64 {
 /// the documented way to make a listing cheaper; `std::fs::read_dir` plus
 /// `DirEntry::metadata` would instead cost a second syscall per entry.
 #[cfg(windows)]
-fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> Option<Listing> {
+fn list_dir(
+    dir: &Path,
+    links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+    index: &FileIndex,
+) -> Option<Listing> {
     let mut scratch = SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
-    let listing = read_dir_fast(dir, links, &mut scratch);
+    let listing = read_dir_fast(dir, links, index, &mut scratch);
     SCRATCH.with(|slot| *slot.borrow_mut() = scratch);
     listing
 }
@@ -466,6 +512,7 @@ fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) ->
 fn read_dir_fast(
     dir: &Path,
     links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+    index: &FileIndex,
     scratch: &mut Scratch,
 ) -> Option<Listing> {
     use windows_sys::Win32::Foundation::{
@@ -543,12 +590,18 @@ fn read_dir_fast(
                 // counted like any other entry: their reported size is the
                 // logical size Explorer shows.
                 let mut size = ((data.nFileSizeHigh as u64) << 32) | data.nFileSizeLow as u64;
+                let modified = file_time_seconds(data.ftLastWriteTime);
                 // Sparse, NTFS-compressed and cloud placeholder files hold less
                 // on the disk than their logical length; ask the volume for the
                 // allocated size of just those, which are rare enough to keep
                 // the extra call off the hot path.
                 let packed = attributes & TIGHTLY_PACKED_ATTRIBUTES != 0;
-                if packed || size >= FILE_FLOOR {
+                // The index only wants a path for a file that can beat one of
+                // its floors, so a tiny file in a huge tree costs two atomics
+                // and no allocation.
+                let indexed = index.wants(size);
+                let have_path = packed || size >= FILE_FLOOR || indexed;
+                if have_path {
                     joined.clear();
                     joined.push(dir);
                     joined.push(OsString::from_wide(name));
@@ -566,6 +619,10 @@ fn read_dir_fast(
                 if !shared {
                     listing.files_seen += 1;
                     listing.bytes += size;
+                    listing.buckets.add(Category::of_wide(name), size);
+                    if have_path {
+                        index.offer(&joined, size, modified);
+                    }
                     if size >= FILE_FLOOR {
                         listing.files.push((size, joined.clone()));
                     }
@@ -589,7 +646,11 @@ fn read_dir_fast(
 /// price `du` pays. That buys the on-disk size (`st_blocks`), which is what the
 /// app reports: a sparse file counts the space it occupies, not what it claims.
 #[cfg(unix)]
-fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) -> Option<Listing> {
+fn list_dir(
+    dir: &Path,
+    links: &Mutex<std::collections::HashSet<(u64, u64)>>,
+    index: &FileIndex,
+) -> Option<Listing> {
     use std::os::unix::fs::MetadataExt;
 
     let mut listing = Listing::empty();
@@ -638,6 +699,10 @@ fn list_dir(dir: &Path, links: &Mutex<std::collections::HashSet<(u64, u64)>>) ->
         }
         listing.files_seen += 1;
         listing.bytes += size;
+        listing
+            .buckets
+            .add(Category::of_path(&path), size);
+        index.offer(&path, size, meta.mtime());
         if size >= FILE_FLOOR {
             listing.files.push((size, path));
         }
@@ -682,6 +747,7 @@ fn walk(
     cancel: &AtomicBool,
     pause: Option<&AtomicBool>,
     counters: &ScanCounters,
+    index: &FileIndex,
     depth: usize,
 ) -> RawNode {
     let mut node = RawNode {
@@ -725,7 +791,7 @@ fn walk(
 
     // One pass gives names, attributes and sizes together, with hard links
     // resolved as the entries are read.
-    let listing = match list_dir(dir, &counters.links) {
+    let listing = match list_dir(dir, &counters.links, index) {
         Some(listing) => listing,
         None => {
             // Not readable (protected, in use, ...) — skip silently but count it.
@@ -746,6 +812,7 @@ fn walk(
     if listing.errors > 0 {
         counters.errors.fetch_add(listing.errors, Ordering::Relaxed);
     }
+    index.add_buckets(&listing.buckets);
 
     // Split whenever a directory actually branches. Rayon steals the work, so
     // deep trees get walked by every core instead of only the first few levels;
@@ -755,13 +822,13 @@ fn walk(
         listing
             .subdirs
             .par_iter()
-            .map(|subdir| walk(subdir, cancel, pause, counters, depth + 1))
+            .map(|subdir| walk(subdir, cancel, pause, counters, index, depth + 1))
             .collect()
     } else {
         listing
             .subdirs
             .iter()
-            .map(|subdir| walk(subdir, cancel, pause, counters, depth + 1))
+            .map(|subdir| walk(subdir, cancel, pause, counters, index, depth + 1))
             .collect()
     };
 
@@ -939,7 +1006,7 @@ fn convert(node: &RawNode, total: u64, depth: usize, budget: &mut usize, parent:
 
 /// Inverse of [`push_verbatim_wide`], for display and for the filesystem calls
 /// that take a path back.
-fn display_path(path: &Path) -> String {
+pub(crate) fn display_path(path: &Path) -> String {
     let mut out = String::new();
     write_display_path(path, &mut out);
     out

@@ -132,6 +132,10 @@ pub enum View {
     /// The Explorer-style details table: one row per direct child with its
     /// size, counts, status, modification date and type.
     Details,
+    /// The biggest files anywhere in the scan, with the folder each one sits in.
+    Files,
+    /// What the scan is made of, by kind of file, with each kind's share.
+    Types,
 }
 
 impl View {
@@ -141,6 +145,8 @@ impl View {
             View::Treemap => "Treemap",
             View::Heatmap => "Heatmap",
             View::Details => "Details",
+            View::Files => "Files",
+            View::Types => "Types",
         }
     }
 
@@ -150,7 +156,14 @@ impl View {
             View::Treemap => "treemap",
             View::Heatmap => "heatmap",
             View::Details => "details",
+            View::Files => "files",
+            View::Types => "types",
         }
+    }
+
+    /// Whether the view draws `chart` — the three ring-and-tile views.
+    pub fn is_chart(self) -> bool {
+        matches!(self, View::Rings | View::Treemap | View::Heatmap)
     }
 
     pub fn parse(value: &str) -> Option<View> {
@@ -159,6 +172,8 @@ impl View {
             "treemap" | "tree" => Some(View::Treemap),
             "heatmap" | "heat" => Some(View::Heatmap),
             "details" | "list" | "table" => Some(View::Details),
+            "files" | "largest" | "biggest" => Some(View::Files),
+            "types" | "categories" | "kinds" => Some(View::Types),
             _ => None,
         }
     }

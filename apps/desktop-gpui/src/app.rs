@@ -1,22 +1,26 @@
-//! The disk-scanner window: a sunburst you can zoom, plus a breakdown panel.
+//! The disk-scanner window: a sunburst you can zoom, plus the file and type
+//! breakdowns that answer "what is actually taking the room".
 
 use std::collections::{HashMap, HashSet};
 use std::f32::consts::TAU;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
     canvas, div, linear_color_stop, linear_gradient, point, px, quad, relative, size,
-    AnyElement, App, BorderStyle, Bounds,
+    uniform_list, AnyElement, App, BorderStyle, Bounds,
     Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollHandle,
-    SharedString, Window, WindowOptions,
+    SharedString, UniformListScrollHandle, Window, WindowOptions,
 };
 
-use disk_scan::{list_drives, scan_pausable, to_dto, DriveInfo, ScanCounters, ScanMeta};
+use disk_scan::{
+    find_duplicates, list_drives, scan_pausable_indexed, to_dto, Category, DriveInfo, DupGroup,
+    DuplicateScan, FileHit, ScanCounters, ScanIndex, ScanMeta,
+};
 
 use crate::model::{
     build_chart, heatmap, hit, log_rank, short_name, treemap, ChartModel, Geom, Kind, Metric, Node,
@@ -125,6 +129,21 @@ const COL_TYPE: f32 = 136.0;
 /// Two presses on the same row inside this window open it, like Explorer.
 const DETAIL_DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
+// The files view: the biggest files in the whole scan, as a table. Rows are a
+// fixed height so `uniform_list` can lay out twenty thousand of them without
+// building twenty thousand elements.
+const FILE_ROW_H: f32 = 24.0;
+const FILE_HEADER_H: f32 = 24.0;
+const FILE_FOLDER_W: f32 = 320.0;
+const FILE_SIZE_W: f32 = 84.0;
+const FILE_DATE_W: f32 = 116.0;
+const FILE_KIND_W: f32 = 92.0;
+
+// A whole drive can hold thousands of duplicate sets. Show the ones holding the
+// most space and say how many were left out, instead of building every row.
+const DUP_GROUPS: usize = 200;
+const DUP_COPIES: usize = 20;
+
 fn menu_row_at(menu: &Menu, x: f32, y: f32) -> Option<usize> {
     if x < menu.x || x > menu.x + MENU_W || y < menu.y || y > menu.y + MENU_H {
         return None;
@@ -213,10 +232,49 @@ impl Placed {
 /// A finished scan kept around so switching back to a drive is instant.
 struct Cached {
     tree: Arc<Node>,
+    /// The files and kind totals the same walk collected, kept with the tree so
+    /// the file and type views are as instant as the chart.
+    index: Arc<ScanIndex>,
     elapsed: f64,
     /// Wall-clock time of the walk, so an entry restored from disk can say how
     /// old it is as well as one from earlier in this session.
     at: SystemTime,
+}
+
+/// Files view: the column the table is ordered by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FileSort {
+    Name,
+    Folder,
+    Size,
+    Modified,
+    Kind,
+}
+
+/// Files view: which of the scan's files are listed, and in what order.
+///
+/// The table holds indices into [`ScanIndex::files`] rather than copies: the
+/// list can be twenty thousand rows, and re-sorting offsets is cheap enough to
+/// do on every header click.
+struct FileTable {
+    sort: FileSort,
+    ascending: bool,
+    /// A kind picked in the Types view, or `None` for the whole scan.
+    filter: Option<Category>,
+    rows: Vec<usize>,
+}
+
+impl Default for FileTable {
+    fn default() -> Self {
+        // Biggest first, matching the details table and the question the app
+        // exists to answer.
+        Self {
+            sort: FileSort::Size,
+            ascending: false,
+            filter: None,
+            rows: Vec::new(),
+        }
+    }
 }
 
 /// One row of the navigation tree: a volume, or a folder below one.
@@ -325,6 +383,34 @@ pub struct DiskApp {
     /// Folder whose dates have already been requested, so a frame never starts
     /// the same walk twice.
     detail_meta_for: Option<String>,
+    /// Whole-scan file index: the biggest files and the bytes per kind.
+    index: Option<Arc<ScanIndex>>,
+    /// Files view: sort, filter and the row order built from `index`.
+    files: FileTable,
+    /// The row order is stale and is rebuilt on the next paint.
+    files_dirty: bool,
+    /// Files view: the selected row's path, so the toolbar can act on it.
+    file_selected: Option<String>,
+    /// Files view: the row last pressed, for the double-click window.
+    file_clicked: Option<(String, Instant)>,
+    /// Files view: where the table is scrolled to.
+    file_scroll: UniformListScrollHandle,
+    /// A delete changed the type totals; say so instead of showing numbers that
+    /// no longer add up until the next full walk.
+    types_stale: bool,
+    /// The duplicate search, once it has run.
+    dupes: Option<Arc<DuplicateScan>>,
+    /// The Files view shows the duplicate list instead of the biggest files.
+    dupes_visible: bool,
+    /// A duplicate search is reading files right now.
+    dupes_running: bool,
+    /// Which search the running job belongs to; a stale result is dropped.
+    dupes_job: Option<u64>,
+    dupes_jobs: u64,
+    /// Raised to stop the running search.
+    dupes_cancel: Option<Arc<AtomicBool>>,
+    /// Files read so far, for the progress line.
+    dupes_progress: Arc<AtomicU64>,
     /// The update check and download, as the status bar's version chip shows it.
     update: Update,
     /// The update card is open over the window.
@@ -365,6 +451,7 @@ impl DiskApp {
                     cache_key(&last_root),
                     Cached {
                         tree: Node::from_dto(snapshot.tree),
+                        index: Arc::new(snapshot.index),
                         elapsed: snapshot.meta.elapsed,
                         at: snapshot.meta.scanned_at,
                     },
@@ -405,6 +492,20 @@ impl DiskApp {
             nav_drag: None,
             detail_meta: Arc::new(Mutex::new(HashMap::new())),
             detail_meta_for: None,
+            index: None,
+            files: FileTable::default(),
+            files_dirty: true,
+            file_selected: None,
+            file_clicked: None,
+            file_scroll: UniformListScrollHandle::new(),
+            types_stale: false,
+            dupes: None,
+            dupes_visible: false,
+            dupes_running: false,
+            dupes_job: None,
+            dupes_jobs: 0,
+            dupes_cancel: None,
+            dupes_progress: Arc::new(AtomicU64::new(0)),
             update: Update::Idle,
             update_open: false,
         };
@@ -711,6 +812,7 @@ impl DiskApp {
         let key = cache_key(&root);
         if let Some(cached) = self.cache.get(&key) {
                 let tree = cached.tree.clone();
+                let index = cached.index.clone();
                 let elapsed = cached.elapsed;
                 let cached_at = cached.at;
                 if let Some(job) = &self.job {
@@ -718,6 +820,7 @@ impl DiskApp {
                 }
                 self.job = None;
                 self.generation += 1;
+                self.reset_duplicates();
                 let same_root = self.last_root.eq_ignore_ascii_case(&root);
                 let focus = if same_root && !self.focus_path.is_empty() {
                     Node::find(&tree, &self.focus_path).unwrap_or_else(|| tree.clone())
@@ -725,6 +828,10 @@ impl DiskApp {
                     tree.clone()
                 };
                 self.tree = Some(tree.clone());
+                self.index = Some(index);
+                self.files_dirty = true;
+                self.file_selected = None;
+                self.types_stale = false;
                 self.focus_path = focus.path.clone();
                 self.show_chart(focus);
                 self.phase = Phase::Ready {
@@ -854,6 +961,7 @@ impl DiskApp {
             return;
         }
 
+        self.reset_duplicates();
         let same_root = self.last_root.eq_ignore_ascii_case(&target);
         self.last_root = target.clone();
         save_last_root(&target);
@@ -862,6 +970,7 @@ impl DiskApp {
         // the scan then runs behind it and refreshes the numbers in place.
         if let Some(cached) = self.cache.get(&cache_key(&target)) {
             let tree = cached.tree.clone();
+            let index = cached.index.clone();
             let focus = if same_root && !self.focus_path.is_empty() {
                 Node::find(&tree, &self.focus_path).unwrap_or_else(|| tree.clone())
             } else {
@@ -870,6 +979,10 @@ impl DiskApp {
             self.focus_path = focus.path.clone();
             self.show_chart(focus);
             self.tree = Some(tree);
+            self.index = Some(index);
+            self.files_dirty = true;
+            self.file_selected = None;
+            self.types_stale = false;
         }
         cx.notify();
         self.spawn_scan(target, subtree, generation, cancel, pause, counters, cx);
@@ -921,8 +1034,8 @@ impl DiskApp {
         cx.spawn(async move |this, cx| {
             let work = cx.background_spawn(async move {
                 let started = Instant::now();
-                match scan_pausable(Path::new(&walk_root), &cancel, &pause, &counters) {
-                    Ok(raw) => {
+                match scan_pausable_indexed(Path::new(&walk_root), &cancel, &pause, &counters) {
+                    Ok((raw, index)) => {
                         let total = raw.size;
                         let elapsed = started.elapsed().as_secs_f64();
                         let dto = to_dto(&raw, total);
@@ -944,12 +1057,12 @@ impl DiskApp {
                                 };
                                 // A cache write that fails must not fail the
                                 // scan: the tree is already in hand.
-                                let _ = disk_scan::cache::save(dir, &meta, &dto);
+                                let _ = disk_scan::cache::save(dir, &meta, &dto, &index);
                             }
                         }
                         let tree = Node::from_dto(dto);
                         let cancelled = cancel.load(Ordering::Relaxed);
-                        Ok((tree, elapsed, cancelled))
+                        Ok((tree, elapsed, cancelled, index))
                     }
                     Err(error) => Err(error),
                 }
@@ -966,7 +1079,7 @@ impl DiskApp {
         generation: u64,
         target: String,
         subtree: bool,
-        result: Result<(Arc<Node>, f64, bool), String>,
+        result: Result<(Arc<Node>, f64, bool, ScanIndex), String>,
         cx: &mut Context<Self>,
     ) {
         if self.generation != generation {
@@ -986,7 +1099,7 @@ impl DiskApp {
         self.job = None;
         self.note = None;
         match result {
-            Ok((tree, elapsed, cancelled)) => {
+            Ok((tree, elapsed, cancelled, index)) => {
                 if cancelled {
                     // This walk was superseded; keep whatever is on screen.
                     match self.cache.get(&cache_key(&self.last_root)) {
@@ -1025,15 +1138,24 @@ impl DiskApp {
                             files: merged.files,
                             bytes: merged.size,
                         };
+                        // The file list keeps the sizes it saw during the full
+                        // walk: one refreshed folder is not worth a second pass
+                        // over the volume's files.
+                        let cached_index = self
+                            .index
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(ScanIndex::default()));
                         self.cache.insert(
                             cache_key(&self.last_root),
                             Cached {
                                 tree: merged.clone(),
+                                index: cached_index,
                                 elapsed,
                                 at: SystemTime::now(),
                             },
                         );
                         self.tree = Some(merged);
+                        self.files_dirty = true;
                         self.note = Some(format!(
                             "Refreshed {} in {}",
                             short_name(&target, 38),
@@ -1051,10 +1173,19 @@ impl DiskApp {
                     files: tree.files,
                     bytes: tree.size,
                 };
+                // A full walk is the only thing that measures every file and
+                // every kind, so it replaces the file and type views outright.
+                let index = Arc::new(index);
+                self.index = Some(index.clone());
+                self.files_dirty = true;
+                self.file_selected = None;
+                self.types_stale = false;
+                self.reset_duplicates();
                 self.cache.insert(
                     cache_key(&self.last_root),
                     Cached {
                         tree: tree.clone(),
+                        index,
                         elapsed,
                         at: SystemTime::now(),
                     },
@@ -1155,7 +1286,1270 @@ impl DiskApp {
         }
         let node = Node::find(&pruned, &self.focus_path).unwrap_or(pruned);
         self.show_chart(node);
+        self.drop_index_under(target);
         cx.notify();
+    }
+
+    /// Forget the indexed files a delete removed.
+    ///
+    /// A Recycle Bin delete changes the volume without a walk, so the file list
+    /// and the type totals would keep counting the files that are gone. The
+    /// bytes per type are only corrected by the next full scan (they are merged
+    /// atomically during the walk), which `types_stale` admits on screen.
+    fn drop_index_under(&mut self, target: &str) {
+        let Some(index) = self.index.clone() else {
+            return;
+        };
+        let gone = |path: &str| is_inside(target, path) || path.eq_ignore_ascii_case(target);
+        let mut files = index.files.clone();
+        let before = files.len();
+        files.retain(|hit| !gone(&hit.path));
+        if files.len() != before {
+            let mut big = index.big.clone();
+            big.retain(|hit| !gone(&hit.path));
+            self.index = Some(Arc::new(ScanIndex {
+                files,
+                big,
+                buckets: index.buckets.clone(),
+            }));
+            self.files_dirty = true;
+            self.types_stale = true;
+            if let Some(scan) = self.dupes.clone() {
+                // The deleted copies are gone, and a set that is down to one
+                // copy is not a duplicate any more.
+                self.dupes = Some(Arc::new(prune_duplicate_copies(&scan, target)));
+            }
+            if self
+                .file_selected
+                .as_deref()
+                .is_some_and(|path| is_inside(target, path))
+            {
+                self.file_selected = None;
+            }
+        }
+    }
+
+    // -------------------------------------------------------- files and types
+
+    /// Put the Files view's row order back in sync with its sort and filter.
+    fn rebuild_files(&mut self) {
+        self.files_dirty = false;
+        let Some(index) = self.index.clone() else {
+            self.files.rows.clear();
+            return;
+        };
+        let filter = self.files.filter;
+        let mut rows: Vec<usize> = index
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| match filter {
+                Some(category) => Category::of_name(file_name(&hit.path)) == category,
+                None => true,
+            })
+            .map(|(offset, _)| offset)
+            .collect();
+        let sort = self.files.sort;
+        let ascending = self.files.ascending;
+        rows.sort_by(|&left, &right| {
+            let (left, right) = (&index.files[left], &index.files[right]);
+            let order = match sort {
+                FileSort::Name => file_name(&left.path).cmp(file_name(&right.path)),
+                FileSort::Folder => file_folder(&left.path).cmp(file_folder(&right.path)),
+                FileSort::Size => left.size.cmp(&right.size),
+                FileSort::Modified => left.modified.cmp(&right.modified),
+                FileSort::Kind => Category::of_name(file_name(&left.path))
+                    .label()
+                    .cmp(Category::of_name(file_name(&right.path)).label()),
+            };
+            let order = if ascending { order } else { order.reverse() };
+            order.then_with(|| left.path.cmp(&right.path))
+        });
+        self.files.rows = rows;
+    }
+
+    /// Sort the Files table, reversing when the active column is picked again.
+    fn set_file_sort(&mut self, sort: FileSort, cx: &mut Context<Self>) {
+        if self.files.sort == sort {
+            self.files.ascending = !self.files.ascending;
+        } else {
+            self.files.sort = sort;
+            // Sizes and dates are asked for biggest/newest first; names and
+            // kinds read better from A to Z.
+            self.files.ascending =
+                matches!(sort, FileSort::Name | FileSort::Folder | FileSort::Kind);
+        }
+        self.files_dirty = true;
+        cx.notify();
+    }
+
+    /// Show one kind of file in the Files view, or every file again.
+    fn filter_files(&mut self, category: Option<Category>, cx: &mut Context<Self>) {
+        self.files.filter = category;
+        self.files.sort = FileSort::Size;
+        self.files.ascending = false;
+        self.files_dirty = true;
+        if self.view != View::Files {
+            self.view = View::Files;
+            save_view(self.view);
+        }
+        cx.notify();
+    }
+
+    /// The selected file, if the selection still names a listed file.
+    fn selected_file(&self) -> Option<FileHit> {
+        let path = self.file_selected.as_deref()?;
+        let index = self.index.as_ref()?;
+        index
+            .files
+            .iter()
+            .find(|hit| hit.path.eq_ignore_ascii_case(path))
+            .cloned()
+    }
+
+    /// A press on a file row: select it, and open its folder on a double press.
+    fn pick_file(&mut self, hit: FileHit, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        let double = self.file_clicked.as_ref().is_some_and(|(path, at)| {
+            now.duration_since(*at) <= DETAIL_DOUBLE_CLICK && path.eq_ignore_ascii_case(&hit.path)
+        });
+        self.file_selected = Some(hit.path.clone());
+        self.file_clicked = Some((hit.path.clone(), now));
+        if double {
+            self.open_containing(&hit, cx);
+        }
+        cx.notify();
+    }
+
+    /// Jump to the folder that holds a file, in the details table.
+    fn open_containing(&mut self, hit: &FileHit, cx: &mut Context<Self>) {
+        let folder = file_folder(&hit.path).to_string();
+        if folder.is_empty() {
+            return;
+        }
+        if self.view != View::Details {
+            self.view = View::Details;
+            save_view(self.view);
+        }
+        self.jump_to(folder, cx);
+    }
+
+    fn reveal_file(&mut self, hit: &FileHit, cx: &mut Context<Self>) {
+        let _ = crate::sys::reveal(&hit.path, false);
+        self.note = Some(format!("Revealed {}", short_name(&hit.path, 44)));
+        cx.notify();
+    }
+
+    /// Write the listed rows to a CSV, so the biggest files can leave the app.
+    fn export_files(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.index.clone() else {
+            return;
+        };
+        let rows: Vec<FileHit> = self
+            .files
+            .rows
+            .iter()
+            .filter_map(|&row| index.files.get(row).cloned())
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let name = format!(
+            "disk-scanner-files-{}.csv",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or(0)
+        );
+        let path = export_dir().join(name);
+        let written = path.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_spawn(async move { write_file_csv(&path, &rows) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.note = Some(match outcome {
+                    Ok(()) => format!(
+                        "Wrote {}",
+                        short_name(&written.display().to_string(), 48)
+                    ),
+                    Err(error) => format!("Could not write the CSV: {error}"),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Drop the duplicate results: the index they were grouped from changed.
+    fn reset_duplicates(&mut self) {
+        self.dupes = None;
+        self.dupes_visible = false;
+        self.dupes_running = false;
+        self.dupes_job = None;
+        if let Some(cancel) = self.dupes_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Start comparing files for identical contents. Only the big files the
+    /// index kept a path for take part, so a folder of small icons cannot make
+    /// the search crawl, and the result only needs read access.
+    fn start_duplicates(&mut self, cx: &mut Context<Self>) {
+        if self.dupes_running {
+            return;
+        }
+        let Some(index) = self.index.clone() else {
+            return;
+        };
+        let files = index.big.clone();
+        self.dupes_visible = true;
+        if files.is_empty() {
+            self.dupes = Some(Arc::new(DuplicateScan::default()));
+            cx.notify();
+            return;
+        }
+        self.dupes = None;
+        self.dupes_running = true;
+        self.dupes_jobs += 1;
+        let job = self.dupes_jobs;
+        self.dupes_job = Some(job);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        self.dupes_cancel = Some(cancel.clone());
+        self.dupes_progress = progress.clone();
+
+        // Repaint while the hashing runs, so the count in the title moves.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(250))
+                .await;
+            let keep = this.update(cx, |this, cx| {
+                if this.dupes_job == Some(job) && this.dupes_running {
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
+            });
+            if !keep.unwrap_or(false) {
+                break;
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let scan = cx
+                .background_spawn(async move { find_duplicates(&files, &cancel, &progress) })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.dupes_job == Some(job) {
+                    this.dupes = Some(Arc::new(scan));
+                    this.dupes_running = false;
+                    this.dupes_job = None;
+                    this.dupes_cancel = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Stop a running search but stay on the duplicates list.
+    fn cancel_duplicates(&mut self, cx: &mut Context<Self>) {
+        if let Some(cancel) = self.dupes_cancel.take() {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.dupes_running = false;
+        self.dupes_job = None;
+        self.dupes = None;
+        cx.notify();
+    }
+
+    /// Leave the duplicate list and go back to the biggest files.
+    fn stop_duplicates(&mut self, cx: &mut Context<Self>) {
+        self.cancel_duplicates(cx);
+        self.dupes_visible = false;
+        cx.notify();
+    }
+
+    fn dupes_header(&self) -> Div {
+        let cell = |text: &'static str, width: Option<f32>, right: bool| {
+            let mut cell = div()
+                .flex_shrink_0()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(px(9.5))
+                .text_color(theme::text_faint());
+            match width {
+                Some(width) => {
+                    cell = cell.w(px(width));
+                    if right {
+                        cell = cell.text_right();
+                    }
+                }
+                None => cell = cell.flex_1().min_w_0(),
+            }
+            cell.child(text)
+        };
+        div()
+            .flex()
+            .items_center()
+            .h(px(FILE_HEADER_H))
+            .gap(px(8.0))
+            .px(px(10.0))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(div().w(px(7.0)))
+            .child(cell("Copy", None, false))
+            .child(cell("Folder", Some(FILE_FOLDER_W), false))
+            .child(cell("Modified", Some(FILE_DATE_W), true))
+    }
+
+    /// The duplicate list: one strip per set of identical files, then the copies
+    /// themselves. Rows are built by hand here because the sets have two row
+    /// heights and `uniform_list` needs one.
+    fn dupes_body(&self, cx: &Context<Self>) -> AnyElement {
+        if self.dupes_running {
+            let hashed = self.dupes_progress.load(Ordering::Relaxed);
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(24.0))
+                .text_size(px(11.0))
+                .text_color(theme::text_dim())
+                .child(format!(
+                    "Comparing files… {} read so far.",
+                    theme::format_count(hashed)
+                ))
+                .into_any_element();
+        }
+        let Some(scan) = self.dupes.as_ref() else {
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(24.0))
+                .text_size(px(11.0))
+                .text_color(theme::text_dim())
+                .child("The search stopped before it finished. Pick Find duplicates to run it again.")
+                .into_any_element();
+        };
+        if scan.groups.is_empty() {
+            let what = if scan.cancelled {
+                "the search stopped early"
+            } else {
+                "no two files of 1 MB or more hold the same bytes"
+            };
+            return div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(24.0))
+                .text_size(px(11.0))
+                .text_color(theme::text_dim())
+                .child(format!(
+                    "Nothing to show: {what} ({} files compared).",
+                    theme::format_count(scan.hashed as u64)
+                ))
+                .into_any_element();
+        }
+
+        let selected = self.file_selected.as_deref();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut hidden = 0usize;
+        for (group_index, group) in scan.groups.iter().enumerate() {
+            if group_index >= DUP_GROUPS {
+                hidden += 1;
+                continue;
+            }
+            rows.push(Self::dup_group_row(group));
+            for (copy_index, copy) in group.copies.iter().take(DUP_COPIES).enumerate() {
+                let selected =
+                    selected.is_some_and(|path| path.eq_ignore_ascii_case(&copy.path));
+                rows.push(Self::dup_copy_row(group_index, copy_index, copy, selected, cx));
+            }
+            if group.copies.len() > DUP_COPIES {
+                rows.push(
+                    div()
+                        .px(px(18.0))
+                        .pb(px(4.0))
+                        .text_size(px(10.0))
+                        .text_color(theme::text_faint())
+                        .child(format!(
+                            "…and {} more copies of this file",
+                            group.copies.len() - DUP_COPIES
+                        ))
+                        .into_any_element(),
+                );
+            }
+        }
+        let mut list = div()
+            .id("dupes-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col();
+        for row in rows {
+            list = list.child(row);
+        }
+        if hidden > 0 {
+            list = list.child(
+                div()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .text_size(px(10.0))
+                    .text_color(theme::text_faint())
+                    .child(format!(
+                        "…and {hidden} more sets. Delete some copies and run the search again to see them."
+                    )),
+            );
+        }
+        list.into_any_element()
+    }
+
+    fn dup_group_row(group: &disk_scan::DupGroup) -> AnyElement {
+        let wasted = group.size * group.copies.len().saturating_sub(1) as u64;
+        div()
+            .h(px(22.0))
+            .flex_shrink_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .text_size(px(9.5))
+            .text_color(theme::text_dim())
+            .child(
+                div()
+                    .w(px(7.0))
+                    .h(px(7.0))
+                    .flex_shrink_0()
+                    .rounded(px(3.5))
+                    .bg(theme::accent()),
+            )
+            .child(format!(
+                "{} · {} each · {} wasted",
+                count_label(group.copies.len(), "copy", "copies"),
+                theme::format_bytes(group.size),
+                theme::format_bytes(wasted)
+            ))
+            .child(div().flex_1())
+            .into_any_element()
+    }
+
+    fn dup_copy_row(
+        group: usize,
+        copy_index: usize,
+        hit: &FileHit,
+        selected: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let click = hit.clone();
+        let mut line = div()
+            .id(SharedString::from(format!("dup-{group}-{copy_index}")))
+            .h(px(FILE_ROW_H))
+            .flex_shrink_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .bg(if selected {
+                theme::accent_soft()
+            } else {
+                theme::surface()
+            })
+            .text_size(px(11.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.pick_file(click.clone(), cx);
+                }),
+            );
+        if !selected {
+            line = line.hover(|style| style.bg(theme::surface_alt()));
+        }
+        line.child(div().w(px(7.0)).flex_shrink_0())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .pl(px(12.0))
+                    .text_color(theme::text())
+                    .child(file_name(&hit.path).to_string()),
+            )
+            .child(
+                div()
+                    .w(px(FILE_FOLDER_W))
+                    .flex_shrink_0()
+                    .truncate()
+                    .text_size(px(10.0))
+                    .text_color(theme::text_faint())
+                    .child(short_folder(file_folder(&hit.path), 46)),
+            )
+            .child(
+                div()
+                    .w(px(FILE_DATE_W))
+                    .flex_shrink_0()
+                    .text_right()
+                    .text_size(px(10.0))
+                    .text_color(theme::text_dim())
+                    .child(format_index_date(hit.modified)),
+            )
+            .into_any_element()
+    }
+
+    /// The biggest files of the whole scan, virtualised: sorting twenty
+    /// thousand offsets is cheap, building twenty thousand rows is not.
+    fn files_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        if self.index.is_none() {
+            return self
+                .waiting_card("Files", &self.waiting_message())
+                .into_any_element();
+        }
+        if self.files_dirty {
+            self.rebuild_files();
+        }
+        let shown = self.files.rows.len();
+        let filter = self.files.filter;
+        let selected = self.selected_file();
+        let scroll = self.file_scroll.clone();
+        let total_bytes = self
+            .index
+            .as_ref()
+            .map(|index| index.total().bytes)
+            .unwrap_or(0);
+        let total_files = self
+            .index
+            .as_ref()
+            .map(|index| index.total().files)
+            .unwrap_or(0);
+
+        let processor = cx.processor(
+            move |this: &mut Self,
+                  range: std::ops::Range<usize>,
+                  _window: &mut Window,
+                  cx: &mut Context<Self>| {
+                let Some(index) = this.index.clone() else {
+                    return Vec::new();
+                };
+                let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
+                for row in range {
+                    let Some(&offset) = this.files.rows.get(row) else {
+                        continue;
+                    };
+                    let Some(hit) = index.files.get(offset) else {
+                        continue;
+                    };
+                    let selected = this
+                        .file_selected
+                        .as_deref()
+                        .is_some_and(|path| path.eq_ignore_ascii_case(&hit.path));
+                    rows.push(Self::file_row(row, hit, selected, cx));
+                }
+                rows
+            },
+        );
+
+        let dupes_mode = self.dupes_visible;
+        let dupes_count = if self.dupes_running {
+            format!(
+                "Comparing {} files…",
+                theme::format_count(self.dupes_progress.load(Ordering::Relaxed))
+            )
+        } else {
+            match self.dupes.as_ref() {
+                Some(scan) if !scan.groups.is_empty() => format!(
+                    "{} · {} · {} wasted",
+                    count_label(scan.groups.len(), "set", "sets"),
+                    count_label(scan.copies(), "copy", "copies"),
+                    theme::format_bytes(scan.wasted())
+                ),
+                Some(scan) => format!(
+                    "{} files compared · nothing repeated",
+                    theme::format_count(scan.hashed as u64)
+                ),
+                None => "no search yet".to_string(),
+            }
+        };
+        let count = if dupes_mode {
+            dupes_count
+        } else {
+            match filter {
+                Some(category) => format!(
+                    "{} {} files · {}",
+                    theme::format_count(shown as u64),
+                    category.label().to_lowercase(),
+                    theme::format_bytes(total_bytes)
+                ),
+                None if shown as u64 >= total_files => format!(
+                    "{} files · {}",
+                    theme::format_count(total_files),
+                    theme::format_bytes(total_bytes)
+                ),
+                None => format!(
+                    "Biggest {} of {} files · {}",
+                    theme::format_count(shown as u64),
+                    theme::format_count(total_files),
+                    theme::format_bytes(total_bytes)
+                ),
+            }
+        };
+
+        let mut title = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .h(px(38.0))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::hairline())
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Files"),
+            )
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(theme::text_dim())
+                    .child(count),
+            )
+            .child(div().flex_1());
+        if let Some(category) = filter.filter(|_| !dupes_mode) {
+            title = title.child(
+                div()
+                    .id("files-clear-filter")
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .bg(theme::accent_soft())
+                    .text_size(px(10.5))
+                    .text_color(theme::text())
+                    .hover(|style| style.bg(theme::surface_alt()))
+                    .on_click(cx.listener(|this, _, _, cx| this.filter_files(None, cx)))
+                    .child(format!("{} ✕", category.label())),
+            );
+        }
+        let (dupes_label, dupes_id, dupes_active) = if self.dupes_running {
+            ("Stop", "files-dupes-stop", true)
+        } else if dupes_mode {
+            ("Duplicates ✕", "files-dupes-clear", true)
+        } else {
+            ("Find duplicates", "files-dupes", false)
+        };
+        title = title.child(
+            div()
+                .id(dupes_id)
+                .flex()
+                .items_center()
+                .px(px(7.0))
+                .py(px(3.0))
+                .rounded(px(5.0))
+                .cursor_pointer()
+                .bg(if dupes_active {
+                    theme::accent_soft()
+                } else {
+                    theme::surface_alt()
+                })
+                .text_size(px(10.5))
+                .text_color(if dupes_active {
+                    theme::text()
+                } else {
+                    theme::text_dim()
+                })
+                .hover(|style| style.bg(theme::surface_alt()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.dupes_running {
+                        this.cancel_duplicates(cx);
+                    } else if this.dupes_visible {
+                        this.stop_duplicates(cx);
+                    } else {
+                        this.start_duplicates(cx);
+                    }
+                }))
+                .child(dupes_label),
+        );
+        if !dupes_mode {
+            title = title.child(self.ghost_button("Export CSV", shown > 0, cx, |this, cx| {
+                this.export_files(cx)
+            }));
+        }
+
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .h(px(36.0))
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(theme::hairline());
+        match &selected {
+            Some(hit) => {
+                actions = actions
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(10.5))
+                            .text_color(theme::text_dim())
+                            .child(hit.path.clone()),
+                    )
+                    .child(self.ghost_button("Show in folder", true, cx, {
+                        let hit = hit.clone();
+                        move |this, cx| this.open_containing(&hit, cx)
+                    }))
+                    .child(self.action_button("↗ Reveal", cx, {
+                        let hit = hit.clone();
+                        move |this, cx| this.reveal_file(&hit, cx)
+                    }))
+                    .child(self.danger_button("🗑 Delete…", true, cx, {
+                        let hit = hit.clone();
+                        move |this, cx| this.ask_delete(file_node(&hit), cx)
+                    }));
+            }
+            None => {
+                actions = actions.child(
+                    div()
+                        .flex_1()
+                        .text_size(px(10.5))
+                        .text_color(theme::text_faint())
+                        .child(if dupes_mode {
+                            "Pick a copy to reveal it or delete it. Keep at least one copy of each set."
+                        } else {
+                            "Pick a row to open its folder, reveal it or move it to the Recycle Bin."
+                        }),
+                );
+            }
+        }
+
+        let body: AnyElement = if dupes_mode {
+            self.dupes_body(cx)
+        } else if shown == 0 {
+            div()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.5))
+                .text_color(theme::text_dim())
+                .child(if filter.is_some() {
+                    "No files of this kind in the scan."
+                } else {
+                    "The scan did not find any files."
+                })
+                .into_any_element()
+        } else {
+            uniform_list("files-rows", shown, processor)
+                .track_scroll(scroll)
+                .flex_1()
+                .min_h_0()
+                .into_any_element()
+        };
+
+        let order = match self.files.sort {
+            FileSort::Name => "name",
+            FileSort::Folder => "folder",
+            FileSort::Size => "size",
+            FileSort::Modified => "modified",
+            FileSort::Kind => "kind",
+        };
+
+        let footer_left = if dupes_mode {
+            "Only files of 1 MB and up are compared, by their bytes, not their names."
+        } else {
+            "Double-click a row to open its folder. Files are matched by name."
+        };
+        let footer_right = if dupes_mode {
+            "Sorted by space wasted".to_string()
+        } else {
+            format!(
+                "Sorted by {order} {}",
+                if self.files.ascending { "↑" } else { "↓" }
+            )
+        };
+
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .child(title)
+            .child(actions)
+            .child(if dupes_mode {
+                self.dupes_header()
+            } else {
+                self.files_header(cx)
+            })
+            .child(body)
+            .child(
+                div()
+                    .h(px(24.0))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .border_t_1()
+                    .border_color(theme::hairline())
+                    .text_size(px(10.0))
+                    .text_color(theme::text_faint())
+                    .child(footer_left)
+                    .child(div().flex_1())
+                    .child(footer_right),
+            )
+            .into_any_element()
+    }
+
+    fn files_header(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .h(px(FILE_HEADER_H))
+            .flex_shrink_0()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .text_size(px(9.5))
+            .text_color(theme::text_faint())
+            // Gutter for the kind dot every row draws first.
+            .child(div().w(px(7.0)).flex_shrink_0())
+            .child(self.file_sort_cell("Name", FileSort::Name, None, false, cx))
+            .child(self.file_sort_cell(
+                "Folder",
+                FileSort::Folder,
+                Some(FILE_FOLDER_W),
+                false,
+                cx,
+            ))
+            .child(self.file_sort_cell(
+                "Size",
+                FileSort::Size,
+                Some(FILE_SIZE_W),
+                true,
+                cx,
+            ))
+            .child(self.file_sort_cell(
+                "Modified",
+                FileSort::Modified,
+                Some(FILE_DATE_W),
+                true,
+                cx,
+            ))
+            .child(self.file_sort_cell(
+                "Kind",
+                FileSort::Kind,
+                Some(FILE_KIND_W),
+                true,
+                cx,
+            ))
+    }
+
+    fn file_sort_cell(
+        &self,
+        label: &'static str,
+        sort: FileSort,
+        width: Option<f32>,
+        right: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.files.sort == sort;
+        let arrow = if active {
+            if self.files.ascending {
+                " ▲"
+            } else {
+                " ▼"
+            }
+        } else {
+            ""
+        };
+        let mut cell = div()
+            .id(SharedString::from(format!("file-sort-{label}")))
+            .cursor_pointer()
+            .text_color(if active {
+                theme::text()
+            } else {
+                theme::text_faint()
+            })
+            .hover(|style| style.text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_file_sort(sort, cx)));
+        match width {
+            Some(width) => {
+                cell = cell.w(px(width)).flex_shrink_0();
+                if right {
+                    cell = cell.text_right();
+                }
+            }
+            None => cell = cell.flex_1().min_w_0(),
+        }
+        cell.child(format!("{label}{arrow}"))
+    }
+
+    /// One row of the file table. The row is built from the hit rather than the
+    /// tree, because these files are not all in it: the list is scan-wide.
+    fn file_row(
+        row: usize,
+        hit: &FileHit,
+        selected: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let name = file_name(&hit.path);
+        let category = Category::of_name(name);
+        let click = hit.clone();
+        let mut line = div()
+            .id(SharedString::from(format!("file-row-{row}")))
+            .h(px(FILE_ROW_H))
+            .flex_shrink_0()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .bg(if selected {
+                theme::accent_soft()
+            } else {
+                theme::surface()
+            })
+            .text_size(px(11.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.pick_file(click.clone(), cx);
+                }),
+            );
+        if !selected {
+            line = line.hover(|style| style.bg(theme::surface_alt()));
+        }
+        line.child(
+            div()
+                .w(px(7.0))
+                .h(px(7.0))
+                .flex_shrink_0()
+                .rounded(px(2.0))
+                .bg(category_color(category)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(theme::text())
+                .child(name.to_string()),
+        )
+        .child(
+            div()
+                .w(px(FILE_FOLDER_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(theme::text_faint())
+                .child(short_folder(file_folder(&hit.path), 46)),
+        )
+        .child(
+            div()
+                .w(px(FILE_SIZE_W))
+                .flex_shrink_0()
+                .text_right()
+                .font_weight(FontWeight::MEDIUM)
+                .child(theme::format_bytes(hit.size)),
+        )
+        .child(
+            div()
+                .w(px(FILE_DATE_W))
+                .flex_shrink_0()
+                .text_size(px(10.0))
+                .text_color(theme::text_dim())
+                .child(format_index_date(hit.modified)),
+        )
+        .child(
+            div()
+                .w(px(FILE_KIND_W))
+                .flex_shrink_0()
+                .truncate()
+                .text_size(px(10.0))
+                .text_color(theme::text_dim())
+                .child(category.label().to_string()),
+        )
+        .into_any_element()
+    }
+
+    /// What the whole scan holds, split by the kind of file it is. A row filters
+    /// the file list, so "video takes 400 GB" is one click from "which videos".
+    fn types_area(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(index) = self.index.clone() else {
+            return self
+                .waiting_card("Types", &self.waiting_message())
+                .into_any_element();
+        };
+        let total = index.total();
+        let mut rows: Vec<(Category, u64, u64)> = index
+            .buckets
+            .iter()
+            .filter(|(_, bucket)| bucket.files > 0)
+            .map(|(category, bucket)| (category, bucket.bytes, bucket.files))
+            .collect();
+        rows.sort_by(|left, right| right.1.cmp(&left.1));
+        let max = rows.first().map(|row| row.1).unwrap_or(0).max(1);
+
+        let mut list = div()
+            .id("types-rows")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll();
+        for (category, bytes, files) in rows {
+            list = list.child(self.type_row(category, bytes, files, total.bytes, max, cx));
+        }
+
+        let mut footer = div()
+            .h(px(26.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .border_t_1()
+            .border_color(theme::hairline())
+            .text_size(px(10.0))
+            .text_color(theme::text_faint())
+            .child("By file name, so a renamed extension counts as what it says.");
+        if self.types_stale {
+            footer = footer.child(div().flex_1()).child(
+                div()
+                    .text_color(theme::danger())
+                    .child("Deleted files are still counted until the next full scan."),
+            );
+        }
+
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .rounded(px(10.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .px(px(12.0))
+                    .h(px(38.0))
+                    .flex_shrink_0()
+                    .border_b_1()
+                    .border_color(theme::hairline())
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Types"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme::text_dim())
+                            .child(format!(
+                                "{} across {} files",
+                                theme::format_bytes(total.bytes),
+                                theme::format_count(total.files)
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme::text_faint())
+                            .child("Click a kind to list its files."),
+                    ),
+            )
+            .child(list)
+            .child(footer)
+            .into_any_element()
+    }
+
+    fn type_row(
+        &self,
+        category: Category,
+        bytes: u64,
+        files: u64,
+        total: u64,
+        max: u64,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let share = if total > 0 {
+            bytes as f64 / total as f64
+        } else {
+            0.0
+        };
+        let ratio = if max > 0 {
+            (bytes as f64 / max as f64) as f32
+        } else {
+            0.0
+        };
+        let color = category_color(category);
+        div()
+            .id(SharedString::from(format!("type-{}", category.slug())))
+            .h(px(44.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(12.0))
+            .border_b_1()
+            .border_color(theme::hairline())
+            .cursor_pointer()
+            .hover(|style| style.bg(theme::surface_alt()))
+            .on_click(cx.listener(move |this, _, _, cx| this.filter_files(Some(category), cx)))
+            .child(
+                div()
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .flex_shrink_0()
+                    .rounded(px(3.0))
+                    .bg(color),
+            )
+            .child(
+                div()
+                    .w(px(150.0))
+                    .flex_shrink_0()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(category.label().to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(theme::track())
+                            .child(
+                                div()
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .w(relative(ratio.clamp(0.004, 1.0)))
+                                    .bg(color),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(52.0))
+                            .flex_shrink_0()
+                            .text_right()
+                            .text_size(px(10.5))
+                            .text_color(theme::text_dim())
+                            .child(theme::format_percent(share)),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(88.0))
+                    .flex_shrink_0()
+                    .text_right()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(theme::format_bytes(bytes)),
+            )
+            .child(
+                div()
+                    .w(px(80.0))
+                    .flex_shrink_0()
+                    .text_right()
+                    .text_size(px(10.0))
+                    .text_color(theme::text_faint())
+                    .child(format!("{} files", theme::format_count(files))),
+            )
+    }
+
+    /// The card shown when a view has nothing to draw yet.
+    fn waiting_card(&self, title: &str, message: &str) -> Div {
+        div()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(430.0))
+                    .rounded(px(12.0))
+                    .bg(theme::surface())
+                    .border_1()
+                    .border_color(theme::hairline())
+                    .p(px(18.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(title.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme::text_dim())
+                            .child(message.to_string()),
+                    ),
+            )
+    }
+
+    fn waiting_message(&self) -> String {
+        match &self.phase {
+            Phase::Failed(error) => format!("The last scan failed: {error}"),
+            Phase::Scanning | Phase::Stopped => {
+                "Counting files — this view is ready as soon as the walk finishes.".to_string()
+            }
+            _ => "Run a scan to see the volume's files here.".to_string(),
+        }
     }
 
     // ----------------------------------------------------------- details view
@@ -2008,12 +3402,14 @@ impl DiskApp {
                     .child(self.view_button(View::Rings, cx))
                     .child(self.view_button(View::Treemap, cx))
                     .child(self.view_button(View::Heatmap, cx))
-                    .child(self.view_button(View::Details, cx)),
+                    .child(self.view_button(View::Details, cx))
+                    .child(self.view_button(View::Files, cx))
+                    .child(self.view_button(View::Types, cx)),
             );
-        // The metric toggle re-proportions the chart. The details table shows a
-        // size and a file count in its own columns, so the buttons mean nothing
-        // while it is open.
-        if self.view != View::Details {
+        // The metric toggle re-proportions a chart. The details table, the file
+        // list and the type totals each carry their own numbers, so the buttons
+        // mean nothing while one of those is open.
+        if self.view.is_chart() {
             bar = bar.child(
                 div()
                     .flex()
@@ -2078,6 +3474,8 @@ impl DiskApp {
             View::Treemap => "▦",
             View::Heatmap => "▩",
             View::Details => "☰",
+            View::Files => "≡",
+            View::Types => "◆",
         };
         div()
             .id(SharedString::from(format!("view-{glyph}")))
@@ -2236,6 +3634,12 @@ impl DiskApp {
 
         if self.view == View::Details {
             return self.details_area(cx).into_any_element();
+        }
+        if self.view == View::Files {
+            return self.files_area(cx).into_any_element();
+        }
+        if self.view == View::Types {
+            return self.types_area(cx).into_any_element();
         }
 
         let Some(chart) = self.chart.clone() else {
@@ -3031,20 +4435,28 @@ impl DiskApp {
             // Refresh the folder in the focus card, or the volume at the root.
             "f5" => self.rescan_focus(cx),
             "r" if event.keystroke.modifiers.control => self.rescan_focus(cx),
-            // 1 / 2 / 3 / 4 pick the visualisation, like the toolbar buttons.
+            // 1 / 2 / 3 / 4 / 5 / 6 pick the view, like the toolbar buttons.
             "1" => self.set_view(View::Rings, cx),
             "2" => self.set_view(View::Treemap, cx),
             "3" => self.set_view(View::Heatmap, cx),
             "4" => self.set_view(View::Details, cx),
-            // In the details view Enter opens the selected folder, as Explorer
-            // does; the other views have no selection to act on.
-            "enter" => {
-                if self.view == View::Details {
+            "5" => self.set_view(View::Files, cx),
+            "6" => self.set_view(View::Types, cx),
+            // Enter opens what is selected: a folder in the details table, or
+            // the folder holding the selected file in the file list.
+            "enter" => match self.view {
+                View::Details => {
                     if let Some(node) = self.selected_detail_node() {
                         self.detail_open(node, cx);
                     }
                 }
-            }
+                View::Files => {
+                    if let Some(hit) = self.selected_file() {
+                        self.open_containing(&hit, cx);
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -4050,7 +5462,8 @@ fn count_label(count: usize, one: &str, many: &str) -> String {
 }
 
 /// One fixed-width column of a details row.
-fn detail_cell(text: String, width: f32, right: bool) -> Div {    let mut cell = div()
+fn detail_cell(text: String, width: f32, right: bool) -> Div {
+    let mut cell = div()
         .w(px(width))
         .flex_shrink_0()
         .px(px(6.0))
@@ -4112,6 +5525,155 @@ fn extension_of(name: &str) -> String {
             extension.to_ascii_lowercase()
         }
         _ => String::new(),
+    }
+}
+
+/// The file name inside a scanned path.
+fn file_name(path: &str) -> &str {
+    match path.rfind(['\\', '/']) {
+        Some(index) if index + 1 < path.len() => &path[index + 1..],
+        Some(_) => path,
+        None => path,
+    }
+}
+
+/// The folder that holds a scanned path, without a trailing separator (except
+/// for a drive root, which is "C:\" and not "C:").
+fn file_folder(path: &str) -> &str {
+    let Some(index) = path.rfind(['\\', '/']) else {
+        return "";
+    };
+    if index == 0 {
+        return &path[..1];
+    }
+    let head = &path[..index];
+    if head.ends_with(':') {
+        return &path[..index + 1];
+    }
+    head
+}
+
+/// The tail of a folder path, so the part that tells two long paths apart
+/// stays visible: `…\disk-scanner\crates\disk-scan`.
+fn short_folder(path: &str, max: usize) -> String {
+    let characters = path.chars().count();
+    if characters <= max {
+        return path.to_string();
+    }
+    let skip = characters - max + 1;
+    format!("…{}", path.chars().skip(skip).collect::<String>())
+}
+
+/// A file from the scan-wide list, as a tree node, so deleting it can reuse the
+/// same confirmation, recycle-bin and tree-pruning path as a chart click.
+fn file_node(hit: &FileHit) -> Arc<Node> {
+    Arc::new(Node {
+        name: file_name(&hit.path).to_string(),
+        path: hit.path.clone(),
+        size: hit.size,
+        files: 1,
+        dirs: 0,
+        kind: Kind::File,
+        children: Vec::new(),
+    })
+}
+
+/// A file's last-write time as the details table would print it.
+fn format_index_date(seconds: i64) -> String {
+    if seconds < 0 {
+        return "—".to_string();
+    }
+    let stamp = UNIX_EPOCH + Duration::from_secs(seconds as u64);
+    crate::sys::format_timestamp(stamp).unwrap_or_else(|| "—".to_string())
+}
+
+/// Take the copies under a deleted path out of the duplicate sets, and drop the
+/// sets that no longer hold at least two copies.
+fn prune_duplicate_copies(scan: &DuplicateScan, target: &str) -> DuplicateScan {
+    let gone = |path: &str| is_inside(target, path) || path.eq_ignore_ascii_case(target);
+    let mut pruned = DuplicateScan {
+        groups: scan
+            .groups
+            .iter()
+            .filter_map(|group| {
+                let copies: Vec<FileHit> = group
+                    .copies
+                    .iter()
+                    .filter(|hit| !gone(&hit.path))
+                    .cloned()
+                    .collect();
+                if copies.len() >= 2 {
+                    Some(DupGroup {
+                        size: group.size,
+                        copies,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        hashed: scan.hashed,
+        cancelled: scan.cancelled,
+    };
+    pruned.groups.sort_by(|left, right| {
+        let wasted = |group: &DupGroup| {
+            group.size * group.copies.len().saturating_sub(1) as u64
+        };
+        wasted(right)
+            .cmp(&wasted(left))
+            .then_with(|| right.size.cmp(&left.size))
+    });
+    pruned
+}
+
+/// One stable colour per file category, reused by the kind dot, the type bars
+/// and the list rows.
+fn category_color(category: Category) -> Hsla {
+    theme::slice_color(theme::root_hue((category.index() * 3) % 14), 1)
+}
+
+/// Where an exported CSV goes: the usual Downloads folder when there is one.
+fn export_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from);
+    if let Some(home) = home {
+        let downloads = home.join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+    }
+    config_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// Writes the file list as CSV. Quoted only where it has to be: a path with a
+/// comma or a quote is rare, and the markdown-free output stays readable.
+fn write_file_csv(path: &Path, rows: &[FileHit]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut text = String::with_capacity(rows.len() * 96 + 64);
+    text.push_str("Name,Folder,Size,Modified,Kind\n");
+    for hit in rows {
+        text.push_str(&csv_cell(file_name(&hit.path)));
+        text.push(',');
+        text.push_str(&csv_cell(file_folder(&hit.path)));
+        text.push(',');
+        text.push_str(&hit.size.to_string());
+        text.push(',');
+        text.push_str(&csv_cell(&format_index_date(hit.modified)));
+        text.push(',');
+        text.push_str(Category::of_name(file_name(&hit.path)).label());
+        text.push('\n');
+    }
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(text.as_bytes())?;
+    file.flush()
+}
+
+fn csv_cell(text: &str) -> String {
+    if text.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_string()
     }
 }
 
@@ -4839,11 +6401,12 @@ impl Render for DiskApp {
                     row = row.child(self.detail_nav(focus, window, cx));
                 }
                 row = row.child(self.chart_area(viewport_w, viewport_h, nav_w, window, cx));
-                // The details table already lists the children with their
-                // numbers, so the breakdown panel would repeat itself. Before
-                // the first chart exists there is nothing to break down either,
-                // and an empty column would push the startup card off centre.
-                if self.view != View::Details && self.chart.is_some() {
+                // The details table, the file list and the type totals already
+                // carry their own numbers, so the breakdown panel would repeat
+                // them. Before the first chart exists there is nothing to break
+                // down either, and an empty column would push the startup card
+                // off centre.
+                if self.view.is_chart() && self.chart.is_some() {
                     row = row.child(self.panel(cx));
                 }
                 row
@@ -5336,6 +6899,118 @@ mod tests {
     fn leaves_unc_paths_alone() {
         let unc = r"\\server\share\folder";
         assert_eq!(breadcrumb_segments(unc), vec![(unc.into(), unc.into())]);
+    }
+
+    #[test]
+    fn splits_a_file_into_name_and_folder() {
+        assert_eq!(file_name(r"C:\Users\me\clip.mp4"), "clip.mp4");
+        assert_eq!(file_folder(r"C:\Users\me\clip.mp4"), r"C:\Users\me");
+        assert_eq!(file_name("/home/me/a.txt"), "a.txt");
+        assert_eq!(file_folder("/home/me/a.txt"), "/home/me");
+        // A file at the root of a volume has to keep the separator, or the
+        // parent stops being a path at all.
+        assert_eq!(file_folder(r"C:\a.txt"), r"C:\");
+        assert_eq!(file_folder("/a.txt"), "/");
+        assert_eq!(file_name("nameless"), "nameless");
+        assert_eq!(file_folder("nameless"), "");
+    }
+
+    #[test]
+    fn shortens_long_folders_from_the_front() {
+        assert_eq!(short_folder(r"C:\short", 20), r"C:\short");
+        let long = short_folder(r"C:\Users\me\Documents\repos\rust-explore\disk-scanner\crates", 20);
+        assert_eq!(long.chars().count(), 20);
+        assert!(long.starts_with('…'));
+        assert!(long.ends_with("crates"));
+    }
+
+    #[test]
+    fn quotes_csv_cells_only_when_needed() {
+        assert_eq!(csv_cell("C:\\plain\\file.txt"), "C:\\plain\\file.txt");
+        assert_eq!(csv_cell("a,b"), "\"a,b\"");
+        assert_eq!(csv_cell("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_cell("two\nlines"), "\"two\nlines\"");
+    }
+
+    #[test]
+    fn writes_a_file_csv_with_a_header_and_one_row_per_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "disk-scanner-csv-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp folder");
+        let path = dir.join("files.csv");
+        let rows = vec![
+            FileHit {
+                path: r"C:\one\movie.mp4".to_string(),
+                size: 2_000_000,
+                modified: -1,
+            },
+            FileHit {
+                path: r"C:\two\notes.txt".to_string(),
+                size: 400,
+                modified: 0,
+            },
+        ];
+        write_file_csv(&path, &rows).expect("write the csv");
+        let text = std::fs::read_to_string(&path).expect("read the csv back");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Name,Folder,Size,Modified,Kind");
+        assert_eq!(lines[1], r"movie.mp4,C:\one,2000000,—,Video");
+        assert!(lines[2].starts_with(r"notes.txt,C:\two,400,"));
+        assert!(lines[2].ends_with(",Documents"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dates_from_the_scan_render_like_the_details_table() {
+        assert_eq!(format_index_date(-1), "—");
+        assert!(!format_index_date(0).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_copy_drops_it_from_its_set_and_forgets_a_lonely_copy() {
+        let hit = |path: &str, size: u64| FileHit {
+            path: path.to_string(),
+            size,
+            modified: -1,
+        };
+        let scan = DuplicateScan {
+            groups: vec![
+                DupGroup {
+                    size: 3_000_000,
+                    copies: vec![
+                        hit(r"C:\photos\holiday.jpg", 3_000_000),
+                        hit(r"C:\backup\holiday copy.jpg", 3_000_000),
+                        hit(r"C:\backup\holiday again.jpg", 3_000_000),
+                    ],
+                },
+                DupGroup {
+                    size: 2_000_000,
+                    copies: vec![
+                        hit(r"C:\a\notes.pdf", 2_000_000),
+                        hit(r"C:\b\notes.pdf", 2_000_000),
+                    ],
+                },
+            ],
+            hashed: 7,
+            cancelled: false,
+        };
+
+        let pruned = prune_duplicate_copies(&scan, r"C:\backup");
+        assert_eq!(pruned.hashed, 7);
+        assert_eq!(pruned.groups.len(), 1, "the set under the deleted path is gone");
+        assert_eq!(pruned.groups[0].copies.len(), 2);
+        assert_eq!(pruned.groups[0].size, 2_000_000);
+
+        // One copy left in its own set: nothing to compare any more.
+        let pruned = prune_duplicate_copies(&scan, r"C:\a");
+        assert_eq!(pruned.groups.len(), 1);
+        assert_eq!(pruned.groups[0].copies.len(), 3);
     }
 }
 #[allow(dead_code)]

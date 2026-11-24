@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use disk_scan::cache::{self, ScanMeta};
-use disk_scan::{scan, to_dto, NodeDto, ScanCounters};
+use disk_scan::{scan_indexed, to_dto, NodeDto, ScanCounters};
 
 fn count(node: &NodeDto) -> usize {
     1 + node.children.iter().map(count).sum::<usize>()
@@ -48,13 +48,14 @@ fn main() {
 
     let counters = ScanCounters::new();
     let walk = Instant::now();
-    let raw = match scan(Path::new(&target), &AtomicBool::new(false), &counters) {
-        Ok(raw) => raw,
+    let raw = match scan_indexed(Path::new(&target), &AtomicBool::new(false), &counters) {
+        Ok((raw, index)) => (raw, index),
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(1);
         }
     };
+    let (raw, index) = raw;
     let walk = walk.elapsed();
     let dto = to_dto(&raw, raw.size);
     let nodes = count(&dto);
@@ -70,7 +71,7 @@ fn main() {
     };
 
     let saving = Instant::now();
-    if let Err(error) = cache::save(&dir, &meta, &dto) {
+    if let Err(error) = cache::save(&dir, &meta, &dto, &index) {
         eprintln!("save failed: {error}");
         std::process::exit(1);
     }

@@ -3,8 +3,9 @@
 [![Latest release](https://img.shields.io/github/v/release/spajce/disk-scanner)](https://github.com/spajce/disk-scanner/releases/latest)
 
 A native desktop app that shows where the space on a drive went. It reads a volume or a
-folder in one pass and draws the result four ways: a zoomable sunburst, a treemap, a heatmap
-and a sortable details table. It runs on Windows, macOS and Linux.
+folder in one pass and draws the result six ways: a zoomable sunburst, a treemap, a heatmap,
+a sortable details table, a list of the biggest files on the whole volume and a breakdown by
+kind of file. It runs on Windows, macOS and Linux.
 
 ![Disk Scanner](docs/screenshot.png)
 
@@ -30,7 +31,7 @@ Building from source — including Intel Macs — is described [below](#building
 
 - **One pass, cancellable.** A volume or a folder, stoppable at any time; *Stop* parks the
   walk with its counters and *Continue* resumes it.
-- **Four views of the same tree** (`1` – `4`, or the buttons in the top bar):
+- **Six views of the same tree** (`1` – `6`, or the buttons in the top bar):
   - **Rings** — a zoomable sunburst, one ring per folder level. Click a slice to open a
     folder; hover to trace its ancestry.
   - **Treemap** — nested rectangles sized by the space used, so the big items read at a
@@ -39,6 +40,17 @@ Building from source — including Intel Macs — is described [below](#building
     a thousand small files stand out as clearly as one big folder.
   - **Details** — a sortable table of the open folder: name, size, file and folder counts,
     status, date modified and type. Click a header to sort, double-click or `Enter` to open.
+  - **Files** — the biggest files anywhere in the scan, whatever folder they sit in, with
+    their folder, size, date modified and kind. Sort on any column, filter to one kind, then
+    open the containing folder, reveal the file, move it to the Recycle Bin, or export the
+    list as CSV. The rows are virtualised, so the whole list scrolls smoothly.
+  - **Types** — the scan's total size split by kind of file (documents, images, video, audio,
+    archives, installers, code, disk images, backups, fonts), largest first, each with its
+    share of the volume and file count. One click lists that kind in the Files view.
+- **Duplicate finder** — from the Files view, compare the files of 1 MB and up by their
+  contents: sizes first, then the start of each file, then the whole file for the survivors
+  only. Identical copies are grouped with the space they waste, and the same toolbar reveals
+  or deletes a copy. The search reads from the disk, can be stopped, and only runs when asked.
 - **Navigation pane** — the volumes with their free and total space and a usage bar, and under
   each one a tree of its folders, opened down to the folder on screen, so any drive, ancestor
   or sibling folder is one click away.
@@ -47,7 +59,8 @@ Building from source — including Intel Macs — is described [below](#building
 - **Breakdown panel** — the biggest items in the open folder, colour-matched to the chart and
   highlighted in step with the pointer.
 - **Act on what you find** — reveal an item in the file manager, or move it to the Recycle
-  Bin after a confirmation. In the details view the same actions sit in the table's toolbar.
+  Bin after a confirmation. In the details and files views the same actions sit in the
+  toolbar.
 - **Live progress** — files, bytes and the folder being read, with a *Stop* button, in the
   card over the chart.
 - **Light, dark, or follow the system** — the choice is remembered.
@@ -55,8 +68,9 @@ Building from source — including Intel Macs — is described [below](#building
   When it is newer, the version in the status bar picks up the accent and a click offers to
   download it; *Restart and install* closes the window, lets a small script swap the binary and
   starts the new build again.
-- **Keyboard** — `Backspace` / `↑` / `←` go up, `1` – `4` switch views, `Enter` opens the
-  selected folder, `F5` or `Ctrl+R` rescans, `Esc` dismisses or pauses.
+- **Keyboard** — `Backspace` / `↑` / `←` go up, `1` – `6` switch views, `Enter` opens the
+  selected folder (in Files, its containing folder), `F5` or `Ctrl+R` rescans, `Esc` dismisses
+  or pauses.
 
 Everything is drawn by the app itself; there is no webview in the window.
 
@@ -72,15 +86,24 @@ Sizes are what the disk actually holds: compressed, sparse and cloud placeholder
 measured by their allocated size, hard links are counted once, and symlinks and other reparse
 points are skipped so nothing is counted twice.
 
+The same pass keeps a small index beside the tree: the largest files on the whole volume and
+the total size and count of each kind of file. It is capped on purpose — twenty thousand
+paths, not millions — so it fits in the snapshot, and the Files and Types views are ready as
+soon as the walk finishes, or on the first frame after a restart. The duplicate search is the
+one thing that reads files again: only the indexed files of a megabyte and up, and only their
+first block before the few survivors are hashed whole.
+
 ## Layout
 
 ```
-apps/desktop-gpui/src/app.rs     window, views, details table, panel, scan plumbing
+apps/desktop-gpui/src/app.rs     window, views, details and files tables, panel, scan plumbing
 apps/desktop-gpui/src/model.rs   tree model, chart geometry, hit testing
 apps/desktop-gpui/src/theme.rs   palettes and number formatting
 apps/desktop-gpui/src/sys.rs     shell integration, theme probe, file dates
 apps/desktop-gpui/src/update.rs  release lookup, download, installer hand-off
 crates/disk-scan/src/scanner.rs  parallel walk and tree compaction
+crates/disk-scan/src/index.rs    largest files and per-kind totals from the same pass
+crates/disk-scan/src/cache.rs    snapshot format for the tree and the index
 crates/disk-scan/src/drives.rs   volume enumeration
 scripts/rust-env.ps1             builds through a complete C++ toolchain
 vendor/xattr/                    one-crate patch, see the note in Cargo.toml
@@ -110,7 +133,8 @@ rescans it on start. A volume already walked in this session repaints instantly 
 A finished walk is also written to `%APPDATA%\disk-scanner\snapshots`, so the first frame of
 the next run draws the previous tree instead of waiting for the walk to finish; the newest
 four snapshots are kept and the walk refreshes them behind the window. A downloaded update
-waits in `%APPDATA%\disk-scanner\updates` until the restart installs it.
+waits in `%APPDATA%\disk-scanner\updates` until the restart installs it. A file list exported
+from the Files view lands in the Downloads folder.
 
 For reference, a full `C:\` walk here (3.25 M files, 532 K folders) takes about 7 s with the
 parallel walker and about 22 s single-threaded.

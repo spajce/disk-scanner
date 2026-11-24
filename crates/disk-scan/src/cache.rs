@@ -15,13 +15,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::index::{Buckets, Category, FileHit, ScanIndex};
 use crate::scanner::child_path;
 use crate::NodeDto;
 
 /// `DSKC` — disk cache. A file that does not start with this is not ours.
 const MAGIC: [u8; 4] = *b"DSKC";
 /// Bumped whenever the payload changes shape; a mismatch is a cache miss.
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 /// Deepest chain the encoder will write or read. `to_dto` caps the tree far
 /// below this, so only a corrupt file can reach it.
 const MAX_DEPTH: usize = 64;
@@ -29,6 +30,8 @@ const MAX_DEPTH: usize = 64;
 const MAX_TEXT: u32 = 65_536;
 /// Largest node count accepted from a file, to bound a corrupt header.
 const MAX_NODES: u32 = 20_000_000;
+/// Largest number of files accepted from a file, to bound a corrupt header.
+const MAX_FILES: u32 = 200_000;
 
 /// What a finished scan is worth remembering, apart from the tree itself.
 pub struct ScanMeta {
@@ -58,6 +61,9 @@ pub struct Snapshot {
     pub meta: ScanMeta,
     /// The compacted tree the window draws.
     pub tree: NodeDto,
+    /// The files and category totals the walk collected outside the tree, so a
+    /// restart keeps the file list and the type breakdown too.
+    pub index: ScanIndex,
 }
 
 /// Where a root's snapshot lives.
@@ -80,9 +86,9 @@ const MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// The payload is built in memory and then swapped in by rename: an interrupted
 /// write leaves the previous snapshot intact instead of a half tree that the
 /// next start-up would try to draw.
-pub fn save(dir: &Path, meta: &ScanMeta, tree: &NodeDto) -> io::Result<()> {
+pub fn save(dir: &Path, meta: &ScanMeta, tree: &NodeDto, index: &ScanIndex) -> io::Result<()> {
     let mut out = Vec::with_capacity(1 << 20);
-    encode(&mut out, meta, tree);
+    encode(&mut out, meta, tree, index);
 
     fs::create_dir_all(dir)?;
     let final_path = path_for(dir, &meta.root);
@@ -196,7 +202,7 @@ fn count_nodes(node: &NodeDto) -> u32 {
     1 + node.children.iter().map(count_nodes).sum::<u32>()
 }
 
-fn encode(out: &mut Vec<u8>, meta: &ScanMeta, tree: &NodeDto) {
+fn encode(out: &mut Vec<u8>, meta: &ScanMeta, tree: &NodeDto, index: &ScanIndex) {
     out.extend_from_slice(&MAGIC);
     put_u16(out, VERSION);
     put_u64(out, millis(meta.scanned_at));
@@ -208,6 +214,33 @@ fn encode(out: &mut Vec<u8>, meta: &ScanMeta, tree: &NodeDto) {
     put_str(out, &meta.root);
     put_u32(out, count_nodes(tree));
     encode_node(out, tree, "");
+    encode_index(out, index);
+}
+
+/// The file index: one slot per category, then the two file lists.
+///
+/// A list is sorted by size before it is written, so the reader can keep the
+/// order and the view has nothing to sort on load.
+fn encode_index(out: &mut Vec<u8>, index: &ScanIndex) {
+    for category in Category::ALL {
+        let slot = index.buckets.get(category);
+        put_u64(out, slot.bytes);
+        put_u64(out, slot.files);
+    }
+    put_u32(out, index.files.len() as u32);
+    for hit in &index.files {
+        encode_hit(out, hit);
+    }
+    put_u32(out, index.big.len() as u32);
+    for hit in &index.big {
+        encode_hit(out, hit);
+    }
+}
+
+fn encode_hit(out: &mut Vec<u8>, hit: &FileHit) {
+    put_u64(out, hit.size);
+    put_u64(out, hit.modified as u64);
+    put_str(out, &hit.path);
 }
 
 /// One node, pre-order, with `parent` supplied by the caller so the path can be
@@ -269,6 +302,7 @@ fn decode(bytes: &[u8]) -> Option<Snapshot> {
     if count_nodes(&tree) != declared {
         return None;
     }
+    let index = decode_index(&mut reader)?;
 
     Some(Snapshot {
         meta: ScanMeta {
@@ -281,7 +315,45 @@ fn decode(bytes: &[u8]) -> Option<Snapshot> {
             errors,
         },
         tree,
+        index,
     })
+}
+
+fn decode_index(reader: &mut Reader<'_>) -> Option<ScanIndex> {
+    let mut buckets = Buckets::default();
+    for category in Category::ALL {
+        let bytes = reader.u64()?;
+        let files = reader.u64()?;
+        let slot = buckets.slot(category);
+        slot.bytes = bytes;
+        slot.files = files;
+    }
+    let files = decode_hits(reader)?;
+    let big = decode_hits(reader)?;
+    Some(ScanIndex {
+        files,
+        big,
+        buckets,
+    })
+}
+
+fn decode_hits(reader: &mut Reader<'_>) -> Option<Vec<FileHit>> {
+    let count = reader.u32()?;
+    if count > MAX_FILES {
+        return None;
+    }
+    let mut hits = Vec::with_capacity(count.min(4096) as usize);
+    for _ in 0..count {
+        let size = reader.u64()?;
+        let modified = reader.u64()? as i64;
+        let path = reader.string()?;
+        hits.push(FileHit {
+            path,
+            size,
+            modified,
+        });
+    }
+    Some(hits)
 }
 
 fn decode_node(reader: &mut Reader<'_>, parent: &str, depth: usize) -> Option<NodeDto> {
@@ -397,6 +469,32 @@ mod tests {
         root
     }
 
+    fn sample_index() -> ScanIndex {
+        let mut buckets = Buckets::default();
+        buckets.add(Category::Documents, 1024);
+        buckets.add(Category::Video, 3072);
+        ScanIndex {
+            files: vec![
+                FileHit {
+                    path: "C:\\Users\\movie.mp4".to_string(),
+                    size: 3072,
+                    modified: 1_700_000_000,
+                },
+                FileHit {
+                    path: "C:\\Users\\note.txt".to_string(),
+                    size: 1024,
+                    modified: -1,
+                },
+            ],
+            big: vec![FileHit {
+                path: "C:\\Users\\movie.mp4".to_string(),
+                size: 3072,
+                modified: 1_700_000_000,
+            }],
+            buckets,
+        }
+    }
+
     fn meta() -> ScanMeta {
         ScanMeta {
             root: "C:\\".to_string(),
@@ -437,7 +535,7 @@ mod tests {
     fn a_snapshot_round_trips() {
         let dir = temp_dir("round-trip");
         let written = meta();
-        save(&dir, &written, &sample()).unwrap();
+        save(&dir, &written, &sample(), &sample_index()).unwrap();
 
         let read = load(&dir, "C:\\").expect("the snapshot just written is there");
         assert_eq!(read.meta.root, written.root);
@@ -448,6 +546,14 @@ mod tests {
         assert_eq!(read.meta.elapsed, written.elapsed);
         assert_eq!(millis(read.meta.scanned_at), millis(written.scanned_at));
         assert_same(&sample(), &read.tree);
+        // The file index rides along, so the file and type views survive a
+        // restart without waiting for a walk.
+        assert_eq!(read.index.files, sample_index().files);
+        assert_eq!(read.index.big, sample_index().big);
+        assert_eq!(
+            read.index.buckets.get(Category::Video),
+            sample_index().buckets.get(Category::Video)
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -455,7 +561,7 @@ mod tests {
     #[test]
     fn a_folded_chain_keeps_its_path_and_its_label() {
         let dir = temp_dir("folded");
-        save(&dir, &meta(), &sample()).unwrap();
+        save(&dir, &meta(), &sample(), &sample_index()).unwrap();
         let read = load(&dir, "c:\\").expect("the root is compared case-insensitively");
 
         let folded = &read.tree.children[0].children[0];
@@ -475,7 +581,7 @@ mod tests {
     #[test]
     fn a_truncated_file_is_a_miss_not_a_panic() {
         let dir = temp_dir("truncated");
-        save(&dir, &meta(), &sample()).unwrap();
+        save(&dir, &meta(), &sample(), &sample_index()).unwrap();
         let path = path_for(&dir, "C:\\");
         let bytes = fs::read(&path).unwrap();
 
@@ -493,7 +599,7 @@ mod tests {
     #[test]
     fn another_roots_snapshot_is_not_used() {
         let dir = temp_dir("other-root");
-        save(&dir, &meta(), &sample()).unwrap();
+        save(&dir, &meta(), &sample(), &sample_index()).unwrap();
         assert!(load(&dir, "D:\\").is_none(), "D: has no snapshot");
         assert!(load(&dir, "C:\\Users").is_none(), "a subfolder is a different root");
         let _ = fs::remove_dir_all(&dir);
@@ -522,7 +628,7 @@ mod tests {
         for index in 0..(KEEP + 3) {
             let mut meta = meta();
             meta.root = format!("{}:\\", (b'A' + index as u8) as char);
-            save(&dir, &meta, &sample()).unwrap();
+            save(&dir, &meta, &sample(), &sample_index()).unwrap();
         }
 
         let files = fs::read_dir(&dir)

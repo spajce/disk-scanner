@@ -228,6 +228,12 @@ pub fn modified(path: &str) -> Option<(std::time::SystemTime, String)> {
     Some((stamp, label))
 }
 
+/// A timestamp in the same `3/26/2025 10:49 pm` form, for dates that came from
+/// the scan itself rather than from a file the list just opened.
+pub fn format_timestamp(stamp: std::time::SystemTime) -> Option<String> {
+    format_local(stamp)
+}
+
 /// UTC → the machine's current time zone, then month/day/year and a 12-hour
 /// clock. `SYSTEMTIME`/`TzSpecificLocalTime` are used rather than arithmetic
 /// because they follow the zone (and its daylight-saving rules) Windows has
