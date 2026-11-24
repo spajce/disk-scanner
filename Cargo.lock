@@ -1279,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-gpui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "disk-scan",
  "embed-resource",
@@ -1356,7 +1356,7 @@ dependencies = [
 
 [[package]]
 name = "disk-scan"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "rayon",
  "serde",
