@@ -39,8 +39,9 @@ Building from source — including Intel Macs — is described [below](#building
     a thousand small files stand out as clearly as one big folder.
   - **Details** — a sortable table of the open folder: name, size, file and folder counts,
     status, date modified and type. Click a header to sort, double-click or `Enter` to open.
-- **Navigation pane** — the volumes with their free and total space and a usage bar, then the
-  chain of folders above the open one, so any drive or ancestor is one click away.
+- **Navigation pane** — the volumes with their free and total space and a usage bar, and under
+  each one a tree of its folders, opened down to the folder on screen, so any drive, ancestor
+  or sibling folder is one click away.
 - **Size or file count** — the chart can be weighted either way; the details table shows
   both, so the toggle is hidden there.
 - **Breakdown panel** — the biggest items in the open folder, colour-matched to the chart and
