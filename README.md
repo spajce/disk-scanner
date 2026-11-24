@@ -51,6 +51,10 @@ Building from source — including Intel Macs — is described [below](#building
 - **Live progress** — files, bytes and the folder being read, with a *Stop* button, in the
   card over the chart.
 - **Light, dark, or follow the system** — the choice is remembered.
+- **Checks for updates** — GitHub's newest release is looked up shortly after the window opens.
+  When it is newer, the version in the status bar picks up the accent and a click offers to
+  download it; *Restart and install* closes the window, lets a small script swap the binary and
+  starts the new build again.
 - **Keyboard** — `Backspace` / `↑` / `←` go up, `1` – `4` switch views, `Enter` opens the
   selected folder, `F5` or `Ctrl+R` rescans, `Esc` dismisses or pauses.
 
@@ -75,6 +79,7 @@ apps/desktop-gpui/src/app.rs     window, views, details table, panel, scan plumb
 apps/desktop-gpui/src/model.rs   tree model, chart geometry, hit testing
 apps/desktop-gpui/src/theme.rs   palettes and number formatting
 apps/desktop-gpui/src/sys.rs     shell integration, theme probe, file dates
+apps/desktop-gpui/src/update.rs  release lookup, download, installer hand-off
 crates/disk-scan/src/scanner.rs  parallel walk and tree compaction
 crates/disk-scan/src/drives.rs   volume enumeration
 scripts/rust-env.ps1             builds through a complete C++ toolchain
@@ -104,7 +109,8 @@ The app remembers the last scanned folder in `%APPDATA%\disk-scanner\last-root.t
 rescans it on start. A volume already walked in this session repaints instantly from memory.
 A finished walk is also written to `%APPDATA%\disk-scanner\snapshots`, so the first frame of
 the next run draws the previous tree instead of waiting for the walk to finish; the newest
-four snapshots are kept and the walk refreshes them behind the window.
+four snapshots are kept and the walk refreshes them behind the window. A downloaded update
+waits in `%APPDATA%\disk-scanner\updates` until the restart installs it.
 
 For reference, a full `C:\` walk here (3.25 M files, 532 K folders) takes about 7 s with the
 parallel walker and about 22 s single-threaded.

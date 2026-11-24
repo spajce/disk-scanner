@@ -163,6 +163,44 @@ pub fn reveal(path: &str, is_dir: bool) {
     }
 }
 
+/// Open `url` in the user's browser: the release page, when the update card
+/// offers one.
+#[cfg(windows)]
+pub fn open_url(url: &str) {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let open: Vec<u16> = "open\0".encode_utf16().collect();
+    let url: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: both strings are NUL-terminated UTF-16 buffers that outlive the
+    // call; the returned handle is only checked against "did it open".
+    let handle = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            open.as_ptr(),
+            url.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if handle as isize <= 32 {
+        eprintln!("could not open the browser (ShellExecuteW returned {handle:?})");
+    }
+}
+
+#[cfg(unix)]
+pub fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+
+    if let Err(error) = Command::new(program).arg(url).spawn() {
+        eprintln!("could not open the browser: {error}");
+    }
+}
+
 /// Handle of the window that owns the current keyboard focus, used as the owner
 /// of the confirmation box so it stays attached to this app.
 #[cfg(windows)]

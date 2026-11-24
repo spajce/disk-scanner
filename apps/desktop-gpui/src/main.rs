@@ -9,6 +9,7 @@ mod app;
 mod model;
 mod sys;
 mod theme;
+mod update;
 
 use gpui::Application;
 

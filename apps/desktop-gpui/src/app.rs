@@ -23,6 +23,7 @@ use crate::model::{
     Tile, View, MAX_RINGS, TREEMAP_HEADER,
 };
 use crate::theme;
+use crate::update;
 
 const TOPBAR_H: f32 = 62.0;
 const STATUSBAR_H: f32 = 30.0;
@@ -249,6 +250,28 @@ struct NavDrag {
     progress: f32,
 }
 
+/// Where the update check stands, from the reader's side: nothing asked yet,
+/// asking, a newer release found, fetching it, or fetched and waiting for the
+/// restart that installs it.
+enum Update {
+    Idle,
+    Checking,
+    /// The running version is the newest release.
+    Current,
+    Available(Arc<update::Release>),
+    Downloading {
+        release: Arc<update::Release>,
+        /// `(received, total)` bytes, shared with the download's worker.
+        progress: Arc<Mutex<(u64, u64)>>,
+        cancel: Arc<AtomicBool>,
+    },
+    Ready {
+        release: Arc<update::Release>,
+        archive: std::path::PathBuf,
+    },
+    Failed(String),
+}
+
 pub struct DiskApp {
     drives: Vec<DriveInfo>,
     tree: Option<Arc<Node>>,
@@ -302,6 +325,10 @@ pub struct DiskApp {
     /// Folder whose dates have already been requested, so a frame never starts
     /// the same walk twice.
     detail_meta_for: Option<String>,
+    /// The update check and download, as the status bar's version chip shows it.
+    update: Update,
+    /// The update card is open over the window.
+    update_open: bool,
 }
 
 impl DiskApp {
@@ -378,6 +405,8 @@ impl DiskApp {
             nav_drag: None,
             detail_meta: Arc::new(Mutex::new(HashMap::new())),
             detail_meta_for: None,
+            update: Update::Idle,
+            update_open: false,
         };
 
         // Follow the OS while the skin is on "Auto": the system appearance can
@@ -404,6 +433,9 @@ impl DiskApp {
         .detach();
 
         app.start_scan(last_root, cx);
+        // The scan comes first; a release check a couple of seconds later only
+        // lights the version chip, so nothing jumps in front of the first frame.
+        app.check_for_updates_soon(cx);
         app
     }
 
@@ -2983,7 +3015,9 @@ impl DiskApp {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         match event.keystroke.key.as_str() {
             "escape" => {
-                if self.menu.is_some() {
+                if self.update_open {
+                    self.close_update(cx);
+                } else if self.menu.is_some() {
                     self.menu = None;
                 } else if matches!(self.phase, Phase::Scanning) {
                     self.stop_scan(cx);
@@ -3330,7 +3364,468 @@ impl DiskApp {
             )
     }
 
-    fn status_bar(&self) -> Div {
+    // --------------------------------------------------------------- updates
+
+    /// Look for a newer release a moment after the window opens. A machine with
+    /// no network stays quiet: only a release that is actually out lights the
+    /// version chip, so a failed background check leaves no trace.
+    fn check_for_updates_soon(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(2500))
+                .await;
+            let _ = this.update(cx, |this, cx| this.start_update_check(false, cx));
+        })
+        .detach();
+    }
+
+    /// Ask GitHub for the newest release. `open` decides whether the card comes
+    /// up with the answer: a check the reader asked for answers in the card, a
+    /// background one only lights the chip.
+    fn start_update_check(&mut self, open: bool, cx: &mut Context<Self>) {
+        if matches!(self.update, Update::Checking | Update::Downloading { .. }) {
+            self.update_open = true;
+            cx.notify();
+            return;
+        }
+        self.update = Update::Checking;
+        self.update_open = open;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let answer = cx.background_spawn(async move { update::check() }).await;
+            let _ = this.update(cx, |this, cx| this.finish_update_check(answer, cx));
+        })
+        .detach();
+    }
+
+    fn finish_update_check(
+        &mut self,
+        answer: Result<update::Release, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update = match answer {
+            Ok(release) if update::is_newer(&release.version, update::VERSION) => {
+                Update::Available(Arc::new(release))
+            }
+            Ok(_) => Update::Current,
+            // A check nobody asked for should not leave a complaint in the bar
+            // for the rest of the session; the reader can ask again by hand.
+            Err(_) if !self.update_open => Update::Idle,
+            Err(error) => Update::Failed(error),
+        };
+        cx.notify();
+    }
+
+    /// Fetch the release's archive for this platform, repainting the card as the
+    /// bytes arrive.
+    fn start_download(&mut self, release: Arc<update::Release>, cx: &mut Context<Self>) {
+        let Some(asset) = release.asset.clone() else {
+            // Nothing to fetch for this platform: the page at least says why.
+            crate::sys::open_url(&release.page);
+            self.note = Some(format!("{} has no build for this platform", release.tag));
+            cx.notify();
+            return;
+        };
+        let Some(dir) = updates_dir() else {
+            self.update = Update::Failed("this machine has no folder for updates".to_string());
+            cx.notify();
+            return;
+        };
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(Mutex::new((0u64, 0u64)));
+        self.update = Update::Downloading {
+            release,
+            progress: progress.clone(),
+            cancel: cancel.clone(),
+        };
+        self.note = Some(format!("Downloading {}", asset.name));
+        cx.notify();
+
+        // Repaint while the bytes come in; the loop dies with the state.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let still_downloading = this.update(cx, |this, cx| {
+                if matches!(this.update, Update::Downloading { .. }) {
+                    cx.notify();
+                    true
+                } else {
+                    false
+                }
+            });
+            if !matches!(still_downloading, Ok(true)) {
+                break;
+            }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            let report_progress = progress.clone();
+            let answer = cx
+                .background_spawn(async move {
+                    let mut report = |done: u64, total: u64| {
+                        if let Ok(mut slot) = report_progress.lock() {
+                            *slot = (done, total);
+                        }
+                    };
+                    update::download(&asset, &dir, &cancel, &mut report)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| this.finish_download(answer, cx));
+        })
+        .detach();
+    }
+
+    fn finish_download(
+        &mut self,
+        answer: Result<std::path::PathBuf, String>,
+        cx: &mut Context<Self>,
+    ) {
+        let release = match &self.update {
+            Update::Downloading { release, .. } => release.clone(),
+            _ => return,
+        };
+        self.update = match answer {
+            Ok(archive) => {
+                self.note = Some("Update downloaded — restart to install it".to_string());
+                Update::Ready { release, archive }
+            }
+            Err(error) if error == "Download cancelled" => {
+                self.note = Some("Download cancelled".to_string());
+                Update::Available(release)
+            }
+            Err(error) => Update::Failed(error),
+        };
+        self.update_open = true;
+        cx.notify();
+    }
+
+    /// Hand over to the installer script and leave: it waits for this process,
+    /// swaps the binary and starts the new build.
+    fn install_update(&mut self, archive: std::path::PathBuf, cx: &mut Context<Self>) {
+        match update::apply(&archive) {
+            Ok(()) => cx.quit(),
+            Err(error) => {
+                self.update = Update::Failed(error);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Close the card. A download in flight is cancelled with it — the card is
+    /// the only place that shows its progress.
+    fn close_update(&mut self, cx: &mut Context<Self>) {
+        if let Update::Downloading { release, cancel, .. } = &self.update {
+            cancel.store(true, Ordering::Relaxed);
+            self.update = Update::Available(release.clone());
+        }
+        self.update_open = false;
+        cx.notify();
+    }
+
+    /// What the status bar's version chip says, one line for every state.
+    fn update_chip_label(&self) -> String {
+        match &self.update {
+            Update::Idle | Update::Current | Update::Failed(_) => {
+                format!("v{}", update::VERSION)
+            }
+            Update::Checking => "checking for updates…".to_string(),
+            Update::Available(release) => format!("↓ {} available", release.tag),
+            Update::Downloading { release, progress, .. } => {
+                let (done, total) = progress.lock().map(|slot| *slot).unwrap_or((0, 0));
+                let share = if total > 0 {
+                    done as f64 / total as f64
+                } else {
+                    0.0
+                };
+                format!("↓ {} · {}", release.tag, theme::format_percent(share))
+            }
+            Update::Ready { release, .. } => format!("↻ restart to update to {}", release.tag),
+        }
+    }
+
+    /// The version in the status bar, which doubles as the way into the update
+    /// card: click it to check now, or to open what the check found.
+    fn version_chip(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+        let loud = matches!(
+            self.update,
+            Update::Available(_) | Update::Downloading { .. } | Update::Ready { .. }
+        );
+        div()
+            .id("update-chip")
+            .px(px(7.0))
+            .py(px(2.0))
+            .rounded(px(6.0))
+            .text_size(px(10.5))
+            .cursor_pointer()
+            .bg(if loud {
+                theme::surface_alt()
+            } else {
+                theme::surface()
+            })
+            .border_1()
+            .border_color(theme::hairline())
+            .text_color(if loud {
+                theme::accent()
+            } else {
+                theme::text_faint()
+            })
+            .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+            .on_click(cx.listener(|this, _, _, cx| this.on_update_chip(cx)))
+            .child(self.update_chip_label())
+    }
+
+    fn on_update_chip(&mut self, cx: &mut Context<Self>) {
+        match &self.update {
+            Update::Available(_) | Update::Ready { .. } => {
+                self.update_open = true;
+                cx.notify();
+            }
+            Update::Checking | Update::Downloading { .. } => {
+                self.update_open = true;
+                cx.notify();
+            }
+            // Nothing to show yet, or the last answer is stale: ask again and
+            // let the card hold the answer.
+            Update::Idle | Update::Current | Update::Failed(_) => {
+                self.start_update_check(true, cx);
+            }
+        }
+    }
+
+    /// A button for the update card. The primary one carries the accent; the
+    /// rest sit on the card's own surface.
+    fn update_button(
+        &self,
+        label: &str,
+        primary: bool,
+        cx: &mut Context<Self>,
+        action: impl Fn(&mut DiskApp, &mut Context<DiskApp>) + 'static,
+    ) -> gpui::Stateful<Div> {
+        div()
+            .id(SharedString::from(format!("update-{label}")))
+            .px(px(12.0))
+            .py(px(6.0))
+            .rounded(px(7.0))
+            .text_size(px(11.5))
+            .font_weight(FontWeight::MEDIUM)
+            .cursor_pointer()
+            .bg(if primary {
+                theme::accent_soft()
+            } else {
+                theme::surface_alt()
+            })
+            .border_1()
+            .border_color(if primary {
+                theme::accent()
+            } else {
+                theme::hairline()
+            })
+            .text_color(if primary {
+                theme::accent()
+            } else {
+                theme::text_dim()
+            })
+            .hover(|style| style.bg(theme::surface_alt()).text_color(theme::text()))
+            .on_click(cx.listener(move |this, _, _, cx| action(this, cx)))
+            .child(label.to_string())
+    }
+
+    /// The update card, over a scrim that dims the window behind it.
+    fn update_card(&self, cx: &mut Context<Self>) -> AnyElement {
+        let running = update::VERSION;
+        let mut card = div()
+            .id("update-card")
+            .w(px(470.0))
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .p(px(18.0))
+            .rounded(px(12.0))
+            .bg(theme::surface())
+            .border_1()
+            .border_color(theme::hairline())
+            // A press inside the card must not reach the scrim behind it.
+            .on_click(cx.listener(|_, _, _, cx| cx.stop_propagation()));
+
+        let (heading, line) = match &self.update {
+            Update::Idle => (
+                "Check for updates".to_string(),
+                format!("Disk Scanner {running}"),
+            ),
+            Update::Checking => (
+                "Checking for updates".to_string(),
+                format!("Asking GitHub for the newest release… Disk Scanner {running}"),
+            ),
+            Update::Current => (
+                "You're up to date".to_string(),
+                format!("Disk Scanner {running} is the newest release."),
+            ),
+            Update::Available(release) => (
+                "Update available".to_string(),
+                format!("{} is out — you are running {running}.", release.tag),
+            ),
+            Update::Downloading { release, .. } => (
+                "Downloading update".to_string(),
+                format!("{} is on its way.", release.tag),
+            ),
+            Update::Ready { release, .. } => (
+                "Update ready".to_string(),
+                format!(
+                    "{} is downloaded. This window will close, the new build will take the old one's place and start again.",
+                    release.tag
+                ),
+            ),
+            Update::Failed(error) => ("Update check failed".to_string(), error.clone()),
+        };
+
+        card = card
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(heading),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme::text_dim())
+                    .child(line),
+            );
+
+        match &self.update {
+            Update::Available(release) => {
+                let detail = match &release.asset {
+                    Some(asset) => format!(
+                        "{} · {}",
+                        asset.name,
+                        theme::format_bytes(asset.size)
+                    ),
+                    None => "This release has no build for this platform — the release page has the source.".to_string(),
+                };
+                card = card.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(theme::text_faint())
+                        .child(detail),
+                );
+            }
+            Update::Downloading { progress, .. } => {
+                let (done, total) = progress.lock().map(|slot| *slot).unwrap_or((0, 0));
+                let share = if total > 0 {
+                    (done as f32 / total as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                card = card
+                    .child(
+                        div()
+                            .h(px(4.0))
+                            .w_full()
+                            .rounded_full()
+                            .bg(theme::track())
+                            .child(
+                                div()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(theme::accent())
+                                    .w(relative(share)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme::text_faint())
+                            .child(format!(
+                                "{} of {}",
+                                theme::format_bytes(done),
+                                theme::format_bytes(total)
+                            )),
+                    );
+            }
+            Update::Ready { archive, .. } => {
+                card = card.child(
+                    div()
+                        .truncate()
+                        .text_size(px(10.5))
+                        .text_color(theme::text_faint())
+                        .child(archive.to_string_lossy().into_owned()),
+                );
+            }
+            _ => {}
+        }
+
+        let mut actions = div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(8.0))
+            .child(self.update_button("Close", false, cx, |this, cx| this.close_update(cx)));
+
+        match &self.update {
+            Update::Available(release) => {
+                if release.asset.is_none() {
+                    let page = release.page.clone();
+                    actions = actions.child(self.update_button(
+                        "Open the release page",
+                        true,
+                        cx,
+                        move |_, _| crate::sys::open_url(&page),
+                    ));
+                } else {
+                    let release = release.clone();
+                    actions = actions.child(self.update_button(
+                        "Download and install",
+                        true,
+                        cx,
+                        move |this, cx| this.start_download(release.clone(), cx),
+                    ));
+                }
+            }
+            Update::Downloading { .. } => {
+                actions = actions.child(self.update_button("Cancel download", false, cx, |this, cx| {
+                    this.close_update(cx)
+                }));
+            }
+            Update::Ready { archive, .. } => {
+                let archive = archive.clone();
+                actions = actions.child(self.update_button(
+                    "Restart and install",
+                    true,
+                    cx,
+                    move |this, cx| this.install_update(archive.clone(), cx),
+                ));
+            }
+            Update::Idle | Update::Current | Update::Failed(_) => {
+                actions = actions.child(self.update_button("Check again", true, cx, |this, cx| {
+                    this.start_update_check(true, cx)
+                }));
+            }
+            Update::Checking => {}
+        }
+
+        card = card.child(actions);
+
+        let (width, height) = self.viewport;
+        div()
+            .id("update-scrim")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .w(px(width))
+            .h(px(height))
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::scrim())
+            .on_click(cx.listener(|this, _, _, cx| this.close_update(cx)))
+            .child(card)
+            .into_any_element()
+    }
+
+    fn status_bar(&self, cx: &mut Context<Self>) -> Div {
         // The card over the chart already carries the live counters, the path
         // being walked and the Stop button, so the bar states the phase and the
         // way out of it instead of repeating the same numbers underneath.
@@ -3370,10 +3865,17 @@ impl DiskApp {
             .text_size(px(10.5))
             .text_color(theme::text_faint())
             .child(div().truncate().child(left))
-            .child(div().truncate().child(right))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(div().truncate().child(right))
+                    .child(self.version_chip(cx)),
+            )
     }
 
-    fn overlays(&self, _cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn overlays(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut layers: Vec<AnyElement> = Vec::new();
 
         if let (Some(tooltip), Some(chart)) = (&self.tooltip, &self.chart) {
@@ -3445,6 +3947,10 @@ impl DiskApp {
             }
         }
 
+
+        if self.update_open {
+            layers.push(self.update_card(cx));
+        }
 
         layers
     }
@@ -4183,6 +4689,11 @@ fn snapshot_dir() -> Option<std::path::PathBuf> {
     Some(config_dir()?.join("snapshots"))
 }
 
+/// Where a downloaded update waits for the restart that installs it.
+fn updates_dir() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("updates"))
+}
+
 /// Age of a cache entry in seconds, for the "from … ago" note.
 fn age_seconds(at: SystemTime) -> f64 {
     SystemTime::now()
@@ -4337,7 +4848,7 @@ impl Render for DiskApp {
                 }
                 row
             })
-            .child(self.status_bar());
+            .child(self.status_bar(cx));
 
         for layer in self.overlays(cx) {
             root = root.child(layer);
