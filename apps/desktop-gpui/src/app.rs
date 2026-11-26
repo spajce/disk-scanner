@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use gpui::prelude::*;
 use gpui::{
     canvas, div, linear_color_stop, linear_gradient, point, px, quad, relative, size,
-    uniform_list, AnyElement, App, BorderStyle, Bounds,
+    uniform_list, AnyElement, App, BorderStyle, Bounds, CursorStyle,
     Context, Div, FocusHandle, FontWeight, Hsla, IntoElement, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point, Render, ScrollHandle,
     SharedString, UniformListScrollHandle, Window, WindowOptions,
@@ -120,12 +120,24 @@ const NAV_INDENT: f32 = 11.0;
 const MAX_NAV_ROWS: usize = 2000;
 /// Thickness of a scrollbar and the gap it keeps from the frame edge.
 const NAV_BAR: f32 = 5.0;
+const COL_NAME: f32 = 420.0;
 const COL_SIZE: f32 = 92.0;
 const COL_FILES: f32 = 70.0;
 const COL_FOLDERS: f32 = 70.0;
 const COL_STATUS: f32 = 66.0;
 const COL_MODIFIED: f32 = 138.0;
 const COL_TYPE: f32 = 136.0;
+/// How wide or narrow a column can be dragged, so a grip can never make one
+/// disappear or swallow the whole table.
+const COL_MIN: f32 = 44.0;
+const COL_MAX: f32 = 460.0;
+/// The name column holds paths, so it gets room to grow beyond COL_MAX.
+const NAME_MIN: f32 = 120.0;
+const NAME_MAX: f32 = 900.0;
+/// Width of the invisible strip on a header's right edge that resizes it.
+const COL_GRIP: f32 = 12.0;
+/// Thickness of the details table's vertical scrollbar.
+const DETAIL_BAR: f32 = 8.0;
 /// Two presses on the same row inside this window open it, like Explorer.
 const DETAIL_DOUBLE_CLICK: Duration = Duration::from_millis(450);
 
@@ -308,6 +320,74 @@ struct NavDrag {
     progress: f32,
 }
 
+/// Widths of the details table's fixed columns. The name column takes whatever
+/// is left, so only these six can be dragged.
+#[derive(Clone, Copy)]
+struct Columns {
+    name: f32,
+    size: f32,
+    files: f32,
+    folders: f32,
+    status: f32,
+    modified: f32,
+    kind: f32,
+}
+
+impl Default for Columns {
+    fn default() -> Self {
+        Self {
+            name: COL_NAME,
+            size: COL_SIZE,
+            files: COL_FILES,
+            folders: COL_FOLDERS,
+            status: COL_STATUS,
+            modified: COL_MODIFIED,
+            kind: COL_TYPE,
+        }
+    }
+}
+
+impl Columns {
+    fn of(&self, key: DetailKey) -> f32 {
+        match key {
+            DetailKey::Name => self.name,
+            DetailKey::Size => self.size,
+            DetailKey::Files => self.files,
+            DetailKey::Folders => self.folders,
+            DetailKey::Status => self.status,
+            DetailKey::Modified => self.modified,
+            DetailKey::Type => self.kind,
+        }
+    }
+
+    fn set(&mut self, key: DetailKey, width: f32) {
+        let width = if key == DetailKey::Name {
+            width.clamp(NAME_MIN, NAME_MAX)
+        } else {
+            width.clamp(COL_MIN, COL_MAX)
+        };
+        match key {
+            DetailKey::Name => self.name = width,
+            DetailKey::Size => self.size = width,
+            DetailKey::Files => self.files = width,
+            DetailKey::Folders => self.folders = width,
+            DetailKey::Status => self.status = width,
+            DetailKey::Modified => self.modified = width,
+            DetailKey::Type => self.kind = width,
+        }
+    }
+}
+
+/// A column grip being dragged, with the width it started from.
+#[derive(Clone, Copy)]
+struct ColDrag {
+    key: DetailKey,
+    /// Pointer x when the drag started.
+    origin: f32,
+    /// Width of the column at that moment.
+    from: f32,
+}
+
 /// Where the update check stands, from the reader's side: nothing asked yet,
 /// asking, a newer release found, fetching it, or fetched and waiting for the
 /// restart that installs it.
@@ -378,6 +458,14 @@ pub struct DiskApp {
     nav_revealed_for: Option<String>,
     /// A scrollbar being dragged, with where it started.
     nav_drag: Option<NavDrag>,
+    /// Details view: where the table is scrolled to, shared with its scrollbar.
+    detail_scroll: ScrollHandle,
+    /// Details view: the scrollbar being dragged, if any.
+    detail_drag: Option<NavDrag>,
+    /// Details view: the widths the columns have been dragged to.
+    columns: Columns,
+    /// The column grip being dragged, if any.
+    col_drag: Option<ColDrag>,
     /// Modification dates for the rows on screen, collected on a worker thread.
     detail_meta: Arc<Mutex<HashMap<String, DetailMeta>>>,
     /// Folder whose dates have already been requested, so a frame never starts
@@ -490,6 +578,10 @@ impl DiskApp {
             nav_size: (-1.0, -1.0),
             nav_revealed_for: None,
             nav_drag: None,
+            detail_scroll: ScrollHandle::new(),
+            detail_drag: None,
+            columns: Columns::default(),
+            col_drag: None,
             detail_meta: Arc::new(Mutex::new(HashMap::new())),
             detail_meta_for: None,
             index: None,
@@ -779,6 +871,144 @@ impl DiskApp {
         if self.nav_drag.take().is_some() {
             cx.notify();
         }
+    }
+
+    /// Thumb length and track length for the details table's scrollbar, or
+    /// `None` when the rows fit.
+    fn detail_bar(&self) -> Option<(f32, f32)> {
+        let hidden = f32::from(self.detail_scroll.max_offset().height);
+        let viewport = f32::from(self.detail_scroll.bounds().size.height);
+        if viewport <= 1.0 || hidden <= 0.5 {
+            return None;
+        }
+        let track = (viewport - DETAIL_BAR * 2.0).max(1.0);
+        let thumb = (track * viewport / (viewport + hidden)).clamp(track.min(24.0), track);
+        Some((thumb, track))
+    }
+
+    /// How far down (0 to 1) the details table is scrolled.
+    fn detail_progress(&self) -> f32 {
+        let hidden = f32::from(self.detail_scroll.max_offset().height);
+        if hidden <= 0.0 {
+            return 0.0;
+        }
+        (-f32::from(self.detail_scroll.offset().y) / hidden).clamp(0.0, 1.0)
+    }
+
+    fn begin_detail_drag(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        self.detail_drag = Some(NavDrag {
+            vertical: true,
+            origin: f32::from(event.position.y),
+            progress: self.detail_progress(),
+        });
+        cx.stop_propagation();
+    }
+
+    /// Follow the details scrollbar while it is being dragged.
+    fn drag_detail(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.detail_drag else { return };
+        if event.pressed_button.is_none() {
+            self.detail_drag = None;
+            return;
+        }
+        let Some((thumb, track)) = self.detail_bar() else {
+            return;
+        };
+        let range = track - thumb;
+        if range <= 0.0 {
+            return;
+        }
+        let progress =
+            (drag.progress + (f32::from(event.position.y) - drag.origin) / range).clamp(0.0, 1.0);
+        let hidden = f32::from(self.detail_scroll.max_offset().height);
+        let current = self.detail_scroll.offset();
+        self.detail_scroll
+            .set_offset(point(current.x, px(-(progress * hidden))));
+        cx.notify();
+    }
+
+    fn end_detail_drag(&mut self, cx: &mut Context<Self>) {
+        if self.detail_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn begin_col_drag(
+        &mut self,
+        key: DetailKey,
+        event: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.col_drag = Some(ColDrag {
+            key,
+            origin: f32::from(event.position.x),
+            from: self.columns.of(key),
+        });
+        // The grip sits on top of the sortable header, so the press must not
+        // also sort the table.
+        cx.stop_propagation();
+    }
+
+    /// Widen or narrow a column while its grip is held.
+    fn drag_columns(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(drag) = self.col_drag else { return };
+        if event.pressed_button.is_none() {
+            self.col_drag = None;
+            return;
+        }
+        let width = drag.from + (f32::from(event.position.x) - drag.origin);
+        self.columns.set(drag.key, width);
+        cx.notify();
+    }
+
+    fn end_col_drag(&mut self, cx: &mut Context<Self>) {
+        if self.col_drag.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Open the shell's own context menu for `path` at the pointer.
+    ///
+    /// The menu is built and run by the shell and blocks until a choice is
+    /// made, so it gets a thread of its own (the shell also hands the menu back
+    /// through a window that belongs to that thread). Once it closes, a choice
+    /// may have renamed, moved or deleted the item, so the open folder is
+    /// walked again and the table shows what is actually on disk.
+    fn shell_menu(&mut self, path: String, cx: &mut Context<Self>) {
+        let done = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(AtomicBool::new(false));
+        let (worker_done, worker_changed) = (done.clone(), changed.clone());
+        let worker_path = path.clone();
+        std::thread::spawn(move || {
+            worker_changed.store(crate::sys::context_menu(&worker_path), Ordering::Relaxed);
+            worker_done.store(true, Ordering::Relaxed);
+        });
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(200))
+                .await;
+            if !done.load(Ordering::Relaxed) {
+                continue;
+            }
+            if changed.load(Ordering::Relaxed) {
+                let _ = this.update(cx, |this, cx| this.after_shell(&path, cx));
+            }
+            break;
+        })
+        .detach();
+    }
+
+    /// Bring the views back in line after the shell has acted on `path`.
+    ///
+    /// The shell can rename, move or delete the item behind the menu and it
+    /// does not tell anyone which it did. When the path is gone its rows are
+    /// dropped from the file index right away; then the open folder is walked
+    /// again, which picks up the new names and counts.
+    fn after_shell(&mut self, path: &str, cx: &mut Context<Self>) {
+        if !Path::new(path).exists() {
+            self.drop_index_under(path);
+        }
+        self.rescan_focus(cx);
     }
 
     fn go_up(&mut self, cx: &mut Context<Self>) {
@@ -1758,6 +1988,7 @@ impl DiskApp {
         cx: &Context<Self>,
     ) -> AnyElement {
         let click = hit.clone();
+        let right_click = hit.path.clone();
         let mut line = div()
             .id(SharedString::from(format!("dup-{group}-{copy_index}")))
             .h(px(FILE_ROW_H))
@@ -1810,6 +2041,14 @@ impl DiskApp {
                     .text_size(px(10.0))
                     .text_color(theme::text_dim())
                     .child(format_index_date(hit.modified)),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.file_selected = Some(right_click.clone());
+                    cx.notify();
+                    this.shell_menu(right_click.clone(), cx);
+                }),
             )
             .into_any_element()
     }
@@ -2227,6 +2466,7 @@ impl DiskApp {
     ) -> AnyElement {
         let name = file_name(&hit.path);
         let category = Category::of_name(name);
+        let right_click = hit.path.clone();
         let click = hit.clone();
         let mut line = div()
             .id(SharedString::from(format!("file-row-{row}")))
@@ -2302,6 +2542,14 @@ impl DiskApp {
                 .text_size(px(10.0))
                 .text_color(theme::text_dim())
                 .child(category.label().to_string()),
+        )
+        .on_mouse_up(
+            MouseButton::Right,
+            cx.listener(move |this, _, _, cx| {
+                this.file_selected = Some(right_click.clone());
+                cx.notify();
+                this.shell_menu(right_click.clone(), cx);
+            }),
         )
         .into_any_element()
     }
@@ -3097,6 +3345,7 @@ impl DiskApp {
             .min_h_0()
             .flex()
             .flex_col()
+            .track_scroll(&self.detail_scroll)
             .overflow_y_scroll();
         for (index, (_, node)) in rows.into_iter().enumerate() {
             let selected = self
@@ -3116,6 +3365,47 @@ impl DiskApp {
             );
         }
 
+        // The window backend paints no scrollbars of its own, so the table draws
+        // one from the handle's offset, the way the navigation pane does. It is
+        // pinned to the right edge of the rows rather than the card, so it never
+        // covers the toolbar or the footer.
+        let mut rows = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(body);
+        if let Some((thumb, track)) = self.detail_bar() {
+            let top = (track - thumb) * self.detail_progress();
+            rows = rows.child(
+                div()
+                    .absolute()
+                    .top(px(DETAIL_BAR))
+                    .right(px(1.0))
+                    .h(px(track))
+                    .w(px(DETAIL_BAR))
+                    .rounded_full()
+                    .bg(theme::track())
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(top))
+                            .w_full()
+                            .h(px(thumb))
+                            .rounded_full()
+                            .bg(theme::text_faint())
+                            .hover(|style| style.bg(theme::text_dim()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.begin_detail_drag(event, cx);
+                                }),
+                            ),
+                    ),
+            );
+        }
+
         div()
             .flex_1()
             .min_w_0()
@@ -3127,6 +3417,19 @@ impl DiskApp {
             .border_1()
             .border_color(theme::hairline())
             .overflow_hidden()
+            // A scrollbar or column drag that started inside the table follows
+            // the pointer wherever it goes, so the card handles the moves.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.drag_detail(event, cx);
+                this.drag_columns(event, cx);
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.end_detail_drag(cx);
+                    this.end_col_drag(cx);
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -3161,7 +3464,7 @@ impl DiskApp {
                     )),
             )
             .child(self.detail_header(cx))
-            .child(body)
+            .child(rows)
             .child(
                 div()
                     .flex()
@@ -3193,41 +3496,61 @@ impl DiskApp {
             .bg(theme::surface_alt())
             .border_b_1()
             .border_color(theme::hairline())
+            .child(self.detail_column("Name", DetailKey::Name, false, cx))
+            .child(self.detail_column("Size", DetailKey::Size, true, cx))
+            .child(self.detail_column("Files", DetailKey::Files, true, cx))
+            .child(self.detail_column("Folders", DetailKey::Folders, true, cx))
+            .child(self.detail_column("Status", DetailKey::Status, false, cx))
+            .child(self.detail_column(
+                "Date Modified",
+                DetailKey::Modified,
+                false,
+                cx,
+            ))
+            .child(self.detail_column("Type", DetailKey::Type, false, cx))
+            // Any room the columns leave over stays on the right, so a wider
+            // window never stretches a column the user sized by hand.
+            .child(div().flex_1())
+    }
+
+    /// One fixed-width header cell: the sortable label, plus the grip on its
+    /// right edge that widens or narrows the column.
+    fn detail_column(
+        &self,
+        label: &str,
+        key: DetailKey,
+        right: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let width = self.columns.of(key);
+        div()
+            .relative()
+            .w(px(width))
+            .flex_basis(px(width))
+            .h(px(DETAIL_HEADER_H))
+            .flex_shrink()
+            .child(
+                self.detail_header_cell(label, key, right, cx)
+                    .w_full()
+                    .h_full(),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.detail_header_cell("Name", DetailKey::Name, false, cx)),
-            )
-            .child(
-                self.detail_header_cell("Size", DetailKey::Size, true, cx)
-                    .w(px(COL_SIZE))
-                    .flex_shrink_0(),
-            )
-            .child(
-                self.detail_header_cell("Files", DetailKey::Files, true, cx)
-                    .w(px(COL_FILES))
-                    .flex_shrink_0(),
-            )
-            .child(
-                self.detail_header_cell("Folders", DetailKey::Folders, true, cx)
-                    .w(px(COL_FOLDERS))
-                    .flex_shrink_0(),
-            )
-            .child(
-                self.detail_header_cell("Status", DetailKey::Status, false, cx)
-                    .w(px(COL_STATUS))
-                    .flex_shrink_0(),
-            )
-            .child(
-                self.detail_header_cell("Date Modified", DetailKey::Modified, false, cx)
-                    .w(px(COL_MODIFIED))
-                    .flex_shrink_0(),
-            )
-            .child(
-                self.detail_header_cell("Type", DetailKey::Type, false, cx)
-                    .w(px(COL_TYPE))
-                    .flex_shrink_0(),
+                    .id(SharedString::from(format!("detail-grip-{label}")))
+                    .absolute()
+                    .top_0()
+                    .right(px(-COL_GRIP))
+                    .h_full()
+                    .w(px(COL_GRIP))
+                    .rounded(px(2.0))
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(|style| style.bg(theme::hairline()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.begin_col_drag(key, event, cx);
+                        }),
+                    ),
             )
     }
 
@@ -3287,6 +3610,7 @@ impl DiskApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let click = node.clone();
+        let menu_path = node.path.clone();
         let glyph = match node.kind {
             Kind::Dir => "📁",
             Kind::File => "📄",
@@ -3324,9 +3648,20 @@ impl DiskApp {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.detail_click(click.clone(), cx);
             }))
+            // The right button asks the shell for its own menu — the same one
+            // Explorer shows — and takes the row's selection with it.
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| {
+                    this.detail_selected = Some(menu_path.clone());
+                    cx.notify();
+                    this.shell_menu(menu_path.clone(), cx);
+                }),
+            )
             .child(
                 div()
-                    .flex_1()
+                    .w(px(self.columns.of(DetailKey::Name)))
+                    .flex_shrink()
                     .min_w_0()
                     .flex()
                     .items_center()
@@ -3345,12 +3680,33 @@ impl DiskApp {
                             .child(node.name.clone()),
                     ),
             )
-            .child(detail_cell(size, COL_SIZE, true))
-            .child(detail_cell(theme::format_count(node.files), COL_FILES, true))
-            .child(detail_cell(theme::format_count(node.dirs), COL_FOLDERS, true))
-            .child(detail_cell(status.to_string(), COL_STATUS, false))
-            .child(detail_cell(date, COL_MODIFIED, false))
-            .child(detail_cell(kind, COL_TYPE, false))
+            .child(detail_cell(
+                size,
+                self.columns.of(DetailKey::Size),
+                true,
+            ))
+            .child(detail_cell(
+                theme::format_count(node.files),
+                self.columns.of(DetailKey::Files),
+                true,
+            ))
+            .child(detail_cell(
+                theme::format_count(node.dirs),
+                self.columns.of(DetailKey::Folders),
+                true,
+            ))
+            .child(detail_cell(
+                status.to_string(),
+                self.columns.of(DetailKey::Status),
+                false,
+            ))
+            .child(detail_cell(
+                date,
+                self.columns.of(DetailKey::Modified),
+                false,
+            ))
+            .child(detail_cell(kind, self.columns.of(DetailKey::Type), false))
+            .child(div().flex_1())
             .into_any_element()
     }
 
@@ -5465,7 +5821,7 @@ fn count_label(count: usize, one: &str, many: &str) -> String {
 fn detail_cell(text: String, width: f32, right: bool) -> Div {
     let mut cell = div()
         .w(px(width))
-        .flex_shrink_0()
+        .flex_shrink()
         .px(px(6.0))
         .truncate()
         .text_size(px(11.0))

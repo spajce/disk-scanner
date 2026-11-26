@@ -40,6 +40,8 @@ Building from source — including Intel Macs — is described [below](#building
     a thousand small files stand out as clearly as one big folder.
   - **Details** — a sortable table of the open folder: name, size, file and folder counts,
     status, date modified and type. Click a header to sort, double-click or `Enter` to open.
+    The rows scroll with a bar on the right, the divider between two headers drags to set that
+    column's width, and a right click hands the folder or file to the shell's own menu.
   - **Files** — the biggest files anywhere in the scan, whatever folder they sit in, with
     their folder, size, date modified and kind. Sort on any column, filter to one kind, then
     open the containing folder, reveal the file, move it to the Recycle Bin, or export the
@@ -60,7 +62,8 @@ Building from source — including Intel Macs — is described [below](#building
   highlighted in step with the pointer.
 - **Act on what you find** — reveal an item in the file manager, or move it to the Recycle
   Bin after a confirmation. In the details and files views the same actions sit in the
-  toolbar.
+  toolbar, and a right click opens the shell's context menu for that item, with whatever the
+  system offers — rename, properties, *Open with*, *Send to*, third-party commands.
 - **Live progress** — files, bytes and the folder being read, with a *Stop* button, in the
   card over the chart.
 - **Light, dark, or follow the system** — the choice is remembered.

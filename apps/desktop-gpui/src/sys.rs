@@ -316,6 +316,26 @@ fn format_local(stamp: std::time::SystemTime) -> Option<String> {
 #[cfg(windows)]
 static ICON_TARGET: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 
+/// The app's own top-level window, for native dialogs and shell menus that want
+/// to be owned by it. Zero when Windows has not shown it yet.
+#[cfg(windows)]
+pub fn main_window() -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    // SAFETY: the callback only reads the window's process id and visibility and
+    // stores into an atomic.
+    unsafe {
+        ICON_TARGET.store(0, std::sync::atomic::Ordering::SeqCst);
+        EnumWindows(Some(find_own_window), 0);
+        ICON_TARGET.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(unix)]
+pub fn main_window() -> isize {
+    0
+}
+
 #[cfg(windows)]
 unsafe extern "system" fn find_own_window(
     hwnd: windows_sys::Win32::Foundation::HWND,
@@ -340,20 +360,18 @@ unsafe extern "system" fn find_own_window(
 pub fn apply_window_icon() {
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
+        GetSystemMetrics, LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON,
         LR_DEFAULTCOLOR, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_SETICON,
     };
 
-    // SAFETY: the callback only touches a static atomic and the Win32 handles
-    // are checked for null before use; resource id 1 is the icon in `app.rc`.
+    let handle = main_window();
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: the Win32 handles are checked for null before use; resource id 1
+    // is the icon in `app.rc`.
     unsafe {
-        ICON_TARGET.store(0, std::sync::atomic::Ordering::SeqCst);
-        EnumWindows(Some(find_own_window), 0);
-        let hwnd = ICON_TARGET.load(std::sync::atomic::Ordering::SeqCst);
-        if hwnd == 0 {
-            return;
-        }
-        let hwnd = hwnd as windows_sys::Win32::Foundation::HWND;
+        let hwnd = handle as windows_sys::Win32::Foundation::HWND;
         let module = GetModuleHandleW(std::ptr::null());
         let id = 1 as *const u16;
 
@@ -456,6 +474,256 @@ pub fn recycle(path: &str) -> Result<(), String> {
         return Err(format!("could not move to the Recycle Bin (error {code})"));
     }
     Ok(())
+}
+
+/// A tiny hidden window, created on the calling thread, so that thread can own
+/// a popup menu.
+///
+/// `TrackPopupMenuEx` only services a menu through a window that belongs to the
+/// thread showing it, and the frame belongs to the main thread. This hands a
+/// worker thread a window of its own; it is never shown. The window procedure
+/// only forwards to `DefWindowProcW`, which is all an owner has to do.
+#[cfg(windows)]
+mod menu_owner {
+    use std::cell::RefCell;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, RegisterClassW, WS_POPUP, WNDCLASSW,
+    };
+
+    thread_local! {
+        static OWNER: RefCell<Option<HWND>> = RefCell::new(None);
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// The owner window for this thread, created on first use.
+    pub fn get() -> HWND {
+        OWNER.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(handle) = *slot {
+                return handle;
+            }
+            let class_name = wide("DiskScannerMenuOwner");
+            let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+            let class = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(wnd_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: module,
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            unsafe { RegisterClassW(&class) };
+            let handle = unsafe {
+                CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    module,
+                    std::ptr::null(),
+                )
+            };
+            *slot = Some(handle);
+            handle
+        })
+    }
+}
+
+/// Show the Windows shell's own context menu for `path`, the way Explorer does.
+///
+/// The menu is built by the shell (`IContextMenu`), so it carries the verbs the
+/// machine actually has — Open, Open with, Properties, Send to, Delete, and any
+/// application that registered one. It blocks while it is open, so call it from
+/// a background thread; the choice is carried out by the shell itself.
+///
+/// Returns whether a verb was invoked, so the caller can refresh what it shows.
+#[cfg(windows)]
+pub fn context_menu(path: &str) -> bool {
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows_sys::Win32::UI::Shell::{
+        SHBindToParent, SHParseDisplayName, CMINVOKECOMMANDINFOEX, CMF_NORMAL,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenuEx, SW_SHOWNORMAL, TPM_RETURNCMD,
+        TPM_RIGHTBUTTON,
+    };
+
+    /// `CMIC_MASK_UNICODE`: the `W` fields of the invoke structure are used.
+    const CMIC_MASK_UNICODE: u32 = 0x0000_4000;
+
+    // {000214E6-0000-0000-C000-000000000046}: IShellFolder.
+    const IID_ISHELLFOLDER: windows_sys::core::GUID =
+        windows_sys::core::GUID::from_u128(0x0002_14e6_0000_0000_c000_0000_0000_0046);
+    // {000214E4-0000-0000-C000-000000000046}: IContextMenu.
+    const IID_ICONTEXTMENU: windows_sys::core::GUID =
+        windows_sys::core::GUID::from_u128(0x0002_14e4_0000_0000_c000_0000_0000_0046);
+
+    type Release = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+    type GetUIObjectOf = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        HWND,
+        u32,
+        *const *mut ITEMIDLIST,
+        *const windows_sys::core::GUID,
+        *mut u32,
+        *mut *mut core::ffi::c_void,
+    ) -> i32;
+    type QueryContextMenu =
+        unsafe extern "system" fn(*mut core::ffi::c_void, *mut core::ffi::c_void, u32, u32, u32, u32)
+            -> i32;
+    type InvokeCommand =
+        unsafe extern "system" fn(*mut core::ffi::c_void, *const CMINVOKECOMMANDINFOEX) -> i32;
+
+    /// A COM object's virtual function slot. Callers pass the index of a method
+    /// whose signature they know; the pointer is only read, never stored.
+    unsafe fn slot<T: Copy>(object: *mut core::ffi::c_void, index: usize) -> Option<T> {
+        if object.is_null() {
+            return None;
+        }
+        // SAFETY: every COM object starts with a pointer to its vtable, and the
+        // indices used below are the documented ones for these interfaces.
+        let table = *(object as *mut *const usize);
+        if table.is_null() {
+            return None;
+        }
+        let entry = *table.add(index);
+        if entry == 0 {
+            return None;
+        }
+        Some(std::mem::transmute_copy(&entry))
+    }
+
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    // The worker thread needs a window of its own to own the popup; the frame
+    // belongs to the thread that paints it.
+    let owner = menu_owner::get();
+    let frame = main_window() as HWND;
+
+    // SAFETY: everything handed to COM outlives the call that uses it, and each
+    // interface is released before the apartment is closed. Shell menus are
+    // documented to run on an STA thread, which the background thread becomes.
+    unsafe {
+        if CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+            return false;
+        }
+
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let mut attributes = 0u32;
+        if SHParseDisplayName(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &mut pidl,
+            0,
+            &mut attributes,
+        ) < 0
+        {
+            CoUninitialize();
+            return false;
+        }
+
+        let mut parent: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut child: *mut ITEMIDLIST = std::ptr::null_mut();
+        let bound = SHBindToParent(pidl, &IID_ISHELLFOLDER, &mut parent, &mut child) >= 0;
+
+        let mut menu_object: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut shown = false;
+        if bound {
+            if let Some(get_ui_object) = slot::<GetUIObjectOf>(parent, 10) {
+                let created = get_ui_object(
+                    parent,
+                    owner,
+                    1,
+                    &child,
+                    &IID_ICONTEXTMENU,
+                    std::ptr::null_mut(),
+                    &mut menu_object,
+                ) >= 0;
+                if created {
+                    let menu = CreatePopupMenu();
+                    let query = slot::<QueryContextMenu>(menu_object, 3);
+                    let invoke = slot::<InvokeCommand>(menu_object, 4);
+                    if !menu.is_null() {
+                        if let (Some(query), Some(invoke)) = (query, invoke) {
+                            // Ids 1.. are ours; the shell fills the menu in.
+                            let filled = query(menu_object, menu, 0, 1, 0x7fff, CMF_NORMAL);
+                            if filled >= 0 {
+                                let mut point = POINT { x: 0, y: 0 };
+                                GetCursorPos(&mut point);
+                                let command = TrackPopupMenuEx(
+                                    menu,
+                                    TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                    point.x,
+                                    point.y,
+                                    owner,
+                                    std::ptr::null(),
+                                );
+                                shown = command > 0;
+                                if command > 0 {
+                                    // The return value is the id the shell gave
+                                    // the verb; the offset is what it expects.
+                                    let ordinal = (command - 1) as usize;
+                                    let mut info: CMINVOKECOMMANDINFOEX =
+                                        std::mem::zeroed();
+                                    info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFOEX>()
+                                        as u32;
+                                    info.fMask = CMIC_MASK_UNICODE;
+                                    info.hwnd = frame;
+                                    info.lpVerb = ordinal as *const u8;
+                                    info.lpVerbW = ordinal as *const u16;
+                                    info.nShow = SW_SHOWNORMAL;
+                                    info.ptInvoke = point;
+                                    invoke(menu_object, &info);
+                                }
+                            }
+                        }
+                        DestroyMenu(menu);
+                    }
+                    if let Some(release) = slot::<Release>(menu_object, 2) {
+                        release(menu_object);
+                    }
+                }
+            }
+            if let Some(release) = slot::<Release>(parent, 2) {
+                release(parent);
+            }
+        }
+        windows_sys::Win32::UI::Shell::ILFree(pidl);
+        CoUninitialize();
+        shown
+    }
+}
+
+/// The shell context menu is Windows-only; elsewhere the app keeps its own
+/// two-item menu.
+#[cfg(unix)]
+pub fn context_menu(_path: &str) -> bool {
+    false
 }
 
 /// Ask a yes/no question in a native dialog before anything is deleted.
