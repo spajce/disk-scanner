@@ -63,7 +63,9 @@ Building from source — including Intel Macs — is described [below](#building
 - **Act on what you find** — reveal an item in the file manager, or move it to the Recycle
   Bin after a confirmation. In the details and files views the same actions sit in the
   toolbar, and a right click opens the shell's context menu for that item, with whatever the
-  system offers — rename, properties, *Open with*, *Send to*, third-party commands.
+  system offers — rename, properties, *Open with*, *Send to*, third-party commands. The
+  navigation pane answers a right click the same way, so a volume or a folder in the tree can
+  be renamed, moved or deleted without leaving the window.
 - **Live progress** — files, bytes and the folder being read, with a *Stop* button, in the
   card over the chart.
 - **Light, dark, or follow the system** — the choice is remembered.

@@ -425,6 +425,13 @@ pub struct DiskApp {
     menu: Option<Menu>,
     /// Row under the pointer inside the open context menu (0 reveal, 1 delete).
     menu_hover: Option<usize>,
+    /// Set while the shell's own menu is up. The menu is modal and runs on its
+    /// own thread, so a right-click that should have dismissed it would
+    /// otherwise start a second popup on top of the first.
+    shell_menu_open: Arc<AtomicBool>,
+    /// A right-click that arrived while the previous shell menu was still
+    /// closing. It opens as soon as that popup is gone.
+    shell_menu_next: Option<String>,
     placed: Arc<Mutex<Placed>>,
     last_root: String,
     note: Option<String>,
@@ -560,6 +567,8 @@ impl DiskApp {
             tooltip: None,
             menu: None,
             menu_hover: None,
+            shell_menu_open: Arc::new(AtomicBool::new(false)),
+            shell_menu_next: None,
             placed,
             last_root: last_root.clone(),
             note: None,
@@ -975,24 +984,56 @@ impl DiskApp {
     /// may have renamed, moved or deleted the item, so the open folder is
     /// walked again and the table shows what is actually on disk.
     fn shell_menu(&mut self, path: String, cx: &mut Context<Self>) {
+        // The popup is modal, so a press that reaches the window landed either
+        // just before it opened or just after it closed. Hold it rather than
+        // drop it: it opens as soon as the previous popup is gone, which keeps
+        // one popup at a time without making the user click twice.
+        if self.shell_menu_open.load(Ordering::SeqCst) {
+            self.shell_menu_next = Some(path);
+            return;
+        }
+        self.shell_menu_open.store(true, Ordering::SeqCst);
         let done = Arc::new(AtomicBool::new(false));
         let changed = Arc::new(AtomicBool::new(false));
         let (worker_done, worker_changed) = (done.clone(), changed.clone());
+        let worker_open = self.shell_menu_open.clone();
         let worker_path = path.clone();
         std::thread::spawn(move || {
-            worker_changed.store(crate::sys::context_menu(&worker_path), Ordering::Relaxed);
-            worker_done.store(true, Ordering::Relaxed);
+            // Clearing the flag on drop is the backstop: `context_menu` clears
+            // it the moment the popup closes, but a shell extension that
+            // panics must not leave menus blocked for good.
+            struct Done {
+                done: Arc<AtomicBool>,
+                open: Arc<AtomicBool>,
+            }
+            impl Drop for Done {
+                fn drop(&mut self) {
+                    self.open.store(false, Ordering::SeqCst);
+                    self.done.store(true, Ordering::Relaxed);
+                }
+            }
+            let guard = Done {
+                done: worker_done,
+                open: worker_open,
+            };
+            let opened = crate::sys::context_menu(&worker_path, &guard.open);
+            worker_changed.store(opened, Ordering::Relaxed);
         });
         cx.spawn(async move |this, cx| loop {
             cx.background_executor()
-                .timer(Duration::from_millis(200))
+                .timer(Duration::from_millis(100))
                 .await;
             if !done.load(Ordering::Relaxed) {
                 continue;
             }
-            if changed.load(Ordering::Relaxed) {
-                let _ = this.update(cx, |this, cx| this.after_shell(&path, cx));
-            }
+            let _ = this.update(cx, |this, cx| {
+                if changed.load(Ordering::Relaxed) {
+                    this.after_shell(&path, cx);
+                }
+                if let Some(next) = this.shell_menu_next.take() {
+                    this.shell_menu(next, cx);
+                }
+            });
             break;
         })
         .detach();
@@ -1007,6 +1048,16 @@ impl DiskApp {
     fn after_shell(&mut self, path: &str, cx: &mut Context<Self>) {
         if !Path::new(path).exists() {
             self.drop_index_under(path);
+            // The navigation tree is keyed by the same path, so the folder that
+            // is gone has to lose its open/closed state as well; keeping it
+            // would make a later folder of the same name start out expanded.
+            let gone = cache_key(path);
+            self.nav_expanded
+                .retain(|open| !open.eq_ignore_ascii_case(&gone) && !is_inside(&gone, open));
+            // The chart may have been looking at the folder that just went
+            // away, and the tree has to be allowed to re-open around wherever
+            // it ends up instead of being held at the old spot.
+            self.nav_revealed_for = None;
         }
         self.rescan_focus(cx);
     }
@@ -2042,7 +2093,7 @@ impl DiskApp {
                     .text_color(theme::text_dim())
                     .child(format_index_date(hit.modified)),
             )
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
                     this.file_selected = Some(right_click.clone());
@@ -2543,7 +2594,7 @@ impl DiskApp {
                 .text_color(theme::text_dim())
                 .child(category.label().to_string()),
         )
-        .on_mouse_up(
+        .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, _, _, cx| {
                 this.file_selected = Some(right_click.clone());
@@ -3026,6 +3077,7 @@ impl DiskApp {
                     let fraction = usage_fraction(&drive);
                     let root = drive.root.clone();
                     let toggle = drive.root.clone();
+                    let menu_root = drive.root.clone();
                     let title = drive_title(&drive);
                     let usage = format!(
                         "{} free of {}",
@@ -3049,6 +3101,14 @@ impl DiskApp {
                                 theme::surface()
                             })
                             .hover(|style| style.bg(theme::surface_alt()))
+                            // The volume answers with the shell's own menu, the
+                            // same one Explorer shows for a drive.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.shell_menu(menu_root.clone(), cx);
+                                }),
+                            )
                             // The header switches to the volume; the chevron
                             // only opens it, so both are separate targets.
                             .child(
@@ -3141,6 +3201,7 @@ impl DiskApp {
                     let is_focus = row.node.path.eq_ignore_ascii_case(&focus_path);
                     let target = row.node.path.clone();
                     let toggle = row.node.path.clone();
+                    let menu_path = row.node.path.clone();
                     let name = if row.node.name.is_empty() {
                         row.node.path.clone()
                     } else {
@@ -3161,6 +3222,14 @@ impl DiskApp {
                                 theme::surface()
                             })
                             .hover(|style| style.bg(theme::surface_alt()))
+                            // A folder answers with the shell's own menu, so the
+                            // tree can rename, move or delete what it lists.
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.shell_menu(menu_path.clone(), cx);
+                                }),
+                            )
                             .child(
                                 // The chevron opens and closes a folder without
                                 // moving the chart, so it is its own click target
@@ -3650,7 +3719,7 @@ impl DiskApp {
             }))
             // The right button asks the shell for its own menu — the same one
             // Explorer shows — and takes the row's selection with it.
-            .on_mouse_up(
+            .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| {
                     this.detail_selected = Some(menu_path.clone());

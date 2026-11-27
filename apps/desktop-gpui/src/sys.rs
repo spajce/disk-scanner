@@ -481,19 +481,31 @@ pub fn recycle(path: &str) -> Result<(), String> {
 ///
 /// `TrackPopupMenuEx` only services a menu through a window that belongs to the
 /// thread showing it, and the frame belongs to the main thread. This hands a
-/// worker thread a window of its own; it is never shown. The window procedure
-/// only forwards to `DefWindowProcW`, which is all an owner has to do.
+/// worker thread a window of its own; it is never shown.
+///
+/// The window procedure also relays the menu messages the shell needs while a
+/// menu is open. Cascade submenus (`Send to`, `Open with`, every application
+/// submenu) are filled in on demand through `IContextMenu3::HandleMenuMsg2`,
+/// and the only window that receives those messages is the menu's owner.
 #[cfg(windows)]
 mod menu_owner {
     use std::cell::RefCell;
     use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, RegisterClassW, WS_POPUP, WNDCLASSW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, WM_DRAWITEM,
+        WM_INITMENUPOPUP, WM_MEASUREITEM, WNDCLASSW, WS_POPUP,
     };
 
+    /// `IContextMenu3::HandleMenuMsg2`. Returns a `HRESULT`; `S_OK` means the
+    /// shell has already answered the message.
+    pub type HandleMenuMsg2 =
+        unsafe extern "system" fn(*mut core::ffi::c_void, u32, usize, isize, *mut isize) -> i32;
+
     thread_local! {
-        static OWNER: RefCell<Option<HWND>> = RefCell::new(None);
+        static OWNER: RefCell<Option<HWND>> = const { RefCell::new(None) };
+        static HOOK: RefCell<Option<(*mut core::ffi::c_void, HandleMenuMsg2)>> =
+            const { RefCell::new(None) };
     }
 
     unsafe extern "system" fn wnd_proc(
@@ -502,7 +514,37 @@ mod menu_owner {
         wparam: usize,
         lparam: isize,
     ) -> isize {
+        // These three arrive only on the owner while a menu is up. Handing them
+        // to the shell is what fills a submenu in and sizes its items; without
+        // it a cascade opens empty and its rows do nothing.
+        if matches!(message, WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM) {
+            if let Some((object, handle)) = HOOK.with(|slot| *slot.borrow()) {
+                let mut result: isize = 0;
+                if handle(object, message, wparam, lparam, &mut result) == 0 {
+                    return result;
+                }
+            }
+        }
         DefWindowProcW(hwnd, message, wparam, lparam)
+    }
+
+    /// Let the owner window route menu messages to `object` until [`unhook`].
+    pub fn hook(object: *mut core::ffi::c_void, handle: HandleMenuMsg2) {
+        HOOK.with(|slot| *slot.borrow_mut() = Some((object, handle)));
+    }
+
+    pub fn unhook() {
+        HOOK.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// Destroy this thread's owner window. The handle lives in a thread-local
+    /// and the menu runs on a short-lived thread, so without this every menu
+    /// would leak one hidden window.
+    pub fn release() {
+        let handle = OWNER.with(|slot| slot.borrow_mut().take());
+        if let Some(handle) = handle {
+            unsafe { DestroyWindow(handle) };
+        }
     }
 
     fn wide(text: &str) -> Vec<u16> {
@@ -561,8 +603,10 @@ mod menu_owner {
 /// a background thread; the choice is carried out by the shell itself.
 ///
 /// Returns whether a verb was invoked, so the caller can refresh what it shows.
+/// `open` is cleared the moment the popup closes, which is before any verb runs,
+/// so a press that lands while the verb works is treated as a new request.
 #[cfg(windows)]
-pub fn context_menu(path: &str) -> bool {
+pub fn context_menu(path: &str, open: &std::sync::atomic::AtomicBool) -> bool {
     use windows_sys::Win32::Foundation::{HWND, POINT};
     use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
     use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
@@ -570,8 +614,8 @@ pub fn context_menu(path: &str) -> bool {
         SHBindToParent, SHParseDisplayName, CMINVOKECOMMANDINFOEX, CMF_NORMAL,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenuEx, SW_SHOWNORMAL, TPM_RETURNCMD,
-        TPM_RIGHTBUTTON,
+        CreatePopupMenu, DestroyMenu, GetCursorPos, PostMessageW, SetForegroundWindow,
+        TrackPopupMenuEx, SW_SHOWNORMAL, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_NULL,
     };
 
     /// `CMIC_MASK_UNICODE`: the `W` fields of the invoke structure are used.
@@ -583,8 +627,16 @@ pub fn context_menu(path: &str) -> bool {
     // {000214E4-0000-0000-C000-000000000046}: IContextMenu.
     const IID_ICONTEXTMENU: windows_sys::core::GUID =
         windows_sys::core::GUID::from_u128(0x0002_14e4_0000_0000_c000_0000_0000_0046);
+    // {BCFCE0A0-EC17-11D0-8D10-00A0C90F2719}: IContextMenu3.
+    const IID_ICONTEXTMENU3: windows_sys::core::GUID =
+        windows_sys::core::GUID::from_u128(0xbcfc_e0a0_ec17_11d0_8d10_00a0_c90f_2719);
 
     type Release = unsafe extern "system" fn(*mut core::ffi::c_void) -> u32;
+    type QueryInterface = unsafe extern "system" fn(
+        *mut core::ffi::c_void,
+        *const windows_sys::core::GUID,
+        *mut *mut core::ffi::c_void,
+    ) -> i32;
     type GetUIObjectOf = unsafe extern "system" fn(
         *mut core::ffi::c_void,
         HWND,
@@ -623,13 +675,14 @@ pub fn context_menu(path: &str) -> bool {
     // The worker thread needs a window of its own to own the popup; the frame
     // belongs to the thread that paints it.
     let owner = menu_owner::get();
-    let frame = main_window() as HWND;
+    let frame_hwnd = main_window() as HWND;
 
     // SAFETY: everything handed to COM outlives the call that uses it, and each
     // interface is released before the apartment is closed. Shell menus are
     // documented to run on an STA thread, which the background thread becomes.
     unsafe {
         if CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+            menu_owner::release();
             return false;
         }
 
@@ -643,6 +696,7 @@ pub fn context_menu(path: &str) -> bool {
             &mut attributes,
         ) < 0
         {
+            menu_owner::release();
             CoUninitialize();
             return false;
         }
@@ -665,6 +719,24 @@ pub fn context_menu(path: &str) -> bool {
                     &mut menu_object,
                 ) >= 0;
                 if created {
+                    // Submenus are filled in on demand through IContextMenu3
+                    // while the menu is up; without it a cascade renders empty
+                    // and its rows do nothing.
+                    let mut hook_object: *mut core::ffi::c_void = std::ptr::null_mut();
+                    let handle_menu =
+                        slot::<QueryInterface>(menu_object, 0).and_then(|query_interface| {
+                            if query_interface(menu_object, &IID_ICONTEXTMENU3, &mut hook_object)
+                                >= 0
+                            {
+                                slot::<menu_owner::HandleMenuMsg2>(hook_object, 7)
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(handle) = handle_menu {
+                        menu_owner::hook(hook_object, handle);
+                    }
+
                     let menu = CreatePopupMenu();
                     let query = slot::<QueryContextMenu>(menu_object, 3);
                     let invoke = slot::<InvokeCommand>(menu_object, 4);
@@ -675,6 +747,11 @@ pub fn context_menu(path: &str) -> bool {
                             if filled >= 0 {
                                 let mut point = POINT { x: 0, y: 0 };
                                 GetCursorPos(&mut point);
+                                // A popup only takes its first click and only
+                                // dismisses on an outside click when its owner
+                                // is the foreground window. The WM_NULL after
+                                // it is the documented hand-back.
+                                SetForegroundWindow(owner);
                                 let command = TrackPopupMenuEx(
                                     menu,
                                     TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -683,6 +760,18 @@ pub fn context_menu(path: &str) -> bool {
                                     owner,
                                     std::ptr::null(),
                                 );
+                                PostMessageW(owner, WM_NULL, 0, 0);
+                                // The popup is gone as soon as the call
+                                // returns, so say so now: the flag must not
+                                // outlive the menu by however long a verb and
+                                // its message pump take.
+                                open.store(false, std::sync::atomic::Ordering::SeqCst);
+                                // Hand the foreground back to the window the
+                                // user was working in, instead of leaving it on
+                                // this hidden owner that is about to die.
+                                if !frame_hwnd.is_null() {
+                                    SetForegroundWindow(frame_hwnd);
+                                }
                                 shown = command > 0;
                                 if command > 0 {
                                     // The return value is the id the shell gave
@@ -693,16 +782,25 @@ pub fn context_menu(path: &str) -> bool {
                                     info.cbSize = std::mem::size_of::<CMINVOKECOMMANDINFOEX>()
                                         as u32;
                                     info.fMask = CMIC_MASK_UNICODE;
-                                    info.hwnd = frame;
+                                    info.hwnd = frame_hwnd;
                                     info.lpVerb = ordinal as *const u8;
                                     info.lpVerbW = ordinal as *const u16;
                                     info.nShow = SW_SHOWNORMAL;
                                     info.ptInvoke = point;
                                     invoke(menu_object, &info);
+                                    // Some verbs hand work back to the thread
+                                    // that invoked them, so the apartment has
+                                    // to keep pumping for a moment instead of
+                                    // being closed under them.
+                                    pump_for(std::time::Duration::from_millis(600));
                                 }
                             }
                         }
                         DestroyMenu(menu);
+                    }
+                    menu_owner::unhook();
+                    if let Some(release) = slot::<Release>(hook_object, 2) {
+                        release(hook_object);
                     }
                     if let Some(release) = slot::<Release>(menu_object, 2) {
                         release(menu_object);
@@ -714,15 +812,40 @@ pub fn context_menu(path: &str) -> bool {
             }
         }
         windows_sys::Win32::UI::Shell::ILFree(pidl);
+        menu_owner::release();
         CoUninitialize();
         shown
+    }
+}
+
+/// Run `window`'s messages for a bounded time after a verb was invoked.
+///
+/// Some shell verbs hand work back to the thread that invoked them (the
+/// properties sheet is the usual one). The thread would otherwise close its
+/// apartment and exit before that work can run. Dispatching blocks while a
+/// modal dialog opened here is up, so the pump ends with the dialog.
+#[cfg(windows)]
+unsafe fn pump_for(window: std::time::Duration) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+    };
+
+    let deadline = std::time::Instant::now() + window;
+    let mut message: MSG = std::mem::zeroed();
+    while std::time::Instant::now() < deadline {
+        if PeekMessageW(&mut message, std::ptr::null_mut(), 0, 0, PM_REMOVE) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
     }
 }
 
 /// The shell context menu is Windows-only; elsewhere the app keeps its own
 /// two-item menu.
 #[cfg(unix)]
-pub fn context_menu(_path: &str) -> bool {
+pub fn context_menu(_path: &str, _open: &std::sync::atomic::AtomicBool) -> bool {
     false
 }
 
