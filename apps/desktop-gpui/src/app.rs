@@ -6545,6 +6545,22 @@ fn reveal_path(node: &Arc<Node>, path: &str, expanded: &mut HashSet<String>) {
     }
 }
 
+/// One byte of a path, folded the way the platform compares two of them.
+///
+/// Windows ignores case and treats both separators alike — `cache_key`
+/// normalises forward slashes for the same reason. Elsewhere the bytes are
+/// compared as they are, because `\` is an ordinary character in a file name.
+fn fold_path_byte(byte: u8) -> u8 {
+    if cfg!(windows) {
+        match byte {
+            b'/' => b'\\',
+            other => other.to_ascii_lowercase(),
+        }
+    } else {
+        byte
+    }
+}
+
 /// Whether `child` lives inside `parent` (`C:\` contains `C:\Users`). The
 /// comparison is case-insensitive on
 /// Windows and case-sensitive elsewhere, and the separator has to follow the
@@ -6553,16 +6569,17 @@ fn is_inside(parent: &str, child: &str) -> bool {
     if parent.len() >= child.len() {
         return false;
     }
-    let separator = std::path::MAIN_SEPARATOR;
     let (parent_bytes, child_bytes) = (parent.as_bytes(), child.as_bytes());
     let matches = child_bytes[..parent_bytes.len()]
         .iter()
         .zip(parent_bytes)
-        .all(|(a, b)| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b });
+        .all(|(a, b)| fold_path_byte(*a) == fold_path_byte(*b));
     if !matches {
         return false;
     }
-    parent.ends_with(separator) || child_bytes[parent_bytes.len()] as char == separator
+    let separator = std::path::MAIN_SEPARATOR as u8;
+    fold_path_byte(*parent_bytes.last().unwrap_or(&0)) == separator
+        || fold_path_byte(child_bytes[parent_bytes.len()]) == separator
 }
 
 /// Swap the subtree at `target` for a freshly walked one, moving the size / file
@@ -7257,6 +7274,10 @@ mod tests {
         assert!(is_inside(r"C:\Users", r"C:\Users\jcarillo"));
         assert!(!is_inside(r"C:\Users", r"C:\UsersX"));
         assert!(!is_inside(r"C:\Users", r"C:\Users"));
+        // A forward slash splits a path here too, whichever side it is on.
+        assert!(is_inside(r"C:\Users", "C:/Users/jcarillo"));
+        assert!(is_inside("C:/Users", r"C:\Users\jcarillo"));
+        assert!(!is_inside(r"C:\Users", "C:/UsersX"));
     }
 
     #[test]
@@ -7267,6 +7288,9 @@ mod tests {
         assert!(!is_inside("/home", "/homebob"));
         assert!(!is_inside("/home", "/home"));
         assert!(!is_inside("/Home", "/home/bob"));
+        // A backslash is an ordinary character in a file name here, not a
+        // separator.
+        assert!(!is_inside("/home", r"/home\bob"));
     }
 
     #[test]
@@ -7399,8 +7423,17 @@ mod tests {
 
     #[test]
     fn deleting_a_copy_drops_it_from_its_set_and_forgets_a_lonely_copy() {
-        let hit = |path: &str, size: u64| FileHit {
-            path: path.to_string(),
+        // Built with the platform's own separator: this test is about
+        // containment, not about how a Windows path happens to be spelled.
+        let path = |parts: &[&str]| {
+            let mut path = PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" });
+            for part in parts {
+                path.push(part);
+            }
+            path.to_string_lossy().into_owned()
+        };
+        let hit = |path: String, size: u64| FileHit {
+            path,
             size,
             modified: -1,
         };
@@ -7409,16 +7442,16 @@ mod tests {
                 DupGroup {
                     size: 3_000_000,
                     copies: vec![
-                        hit(r"C:\photos\holiday.jpg", 3_000_000),
-                        hit(r"C:\backup\holiday copy.jpg", 3_000_000),
-                        hit(r"C:\backup\holiday again.jpg", 3_000_000),
+                        hit(path(&["photos", "holiday.jpg"]), 3_000_000),
+                        hit(path(&["backup", "holiday copy.jpg"]), 3_000_000),
+                        hit(path(&["backup", "holiday again.jpg"]), 3_000_000),
                     ],
                 },
                 DupGroup {
                     size: 2_000_000,
                     copies: vec![
-                        hit(r"C:\a\notes.pdf", 2_000_000),
-                        hit(r"C:\b\notes.pdf", 2_000_000),
+                        hit(path(&["a", "notes.pdf"]), 2_000_000),
+                        hit(path(&["b", "notes.pdf"]), 2_000_000),
                     ],
                 },
             ],
@@ -7426,14 +7459,14 @@ mod tests {
             cancelled: false,
         };
 
-        let pruned = prune_duplicate_copies(&scan, r"C:\backup");
+        let pruned = prune_duplicate_copies(&scan, &path(&["backup"]));
         assert_eq!(pruned.hashed, 7);
         assert_eq!(pruned.groups.len(), 1, "the set under the deleted path is gone");
         assert_eq!(pruned.groups[0].copies.len(), 2);
         assert_eq!(pruned.groups[0].size, 2_000_000);
 
         // One copy left in its own set: nothing to compare any more.
-        let pruned = prune_duplicate_copies(&scan, r"C:\a");
+        let pruned = prune_duplicate_copies(&scan, &path(&["a"]));
         assert_eq!(pruned.groups.len(), 1);
         assert_eq!(pruned.groups[0].copies.len(), 3);
     }
